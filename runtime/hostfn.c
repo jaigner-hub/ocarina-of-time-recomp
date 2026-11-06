@@ -17,11 +17,22 @@
 #define MAX_HOSTFN 4096   // dispatch.c holds HOST_CAP / 2 host functions
 #define MAX_ADDED 64
 
+#ifdef _WIN32
 // PE/COFF: the linker sorts .ovr$a < .ovr$m (entries, host.h) < .ovr$z by the text after '$'.
 __attribute__((section(".ovr$a"), used)) static const RtHostEntry ovr_start[1];
 __attribute__((section(".ovr$z"), used)) static const RtHostEntry ovr_stop[1];
 __attribute__((section(".obs$a"), used)) static const RtHostEntry obs_start[1];
 __attribute__((section(".obs$z"), used)) static const RtHostEntry obs_stop[1];
+#else
+// ELF: GNU ld brackets a section named like a C identifier with __start_<name> and __stop_<name> (weak: a build with no
+// entries of one kind still links).
+extern const RtHostEntry __start_ovr[] __attribute__((weak)), __stop_ovr[] __attribute__((weak));
+extern const RtHostEntry __start_obs[] __attribute__((weak)), __stop_obs[] __attribute__((weak));
+#define ovr_start __start_ovr
+#define ovr_stop __stop_ovr
+#define obs_start __start_obs
+#define obs_stop __stop_obs
+#endif
 
 typedef struct {
     const char *name;

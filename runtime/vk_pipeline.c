@@ -45,12 +45,14 @@
 // MacNativeGames games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m pso_key_fill / pso_desc / msl_varyings and its vfmt
 // table @ b75be8cf (MIT, Copyright (c) 2026 jhaizhou); the binding conventions are those of Ryujinx's shader translator
 // (MIT, tools/vendor/ryujinx).
-#include <io.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-#include <psapi.h>
+#include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#endif
 
 #include "cfg.h"
 #include "gfx.h"
@@ -59,7 +61,18 @@
 #include "platform/platform.h"
 #include "tex.h"
 
-#define LOG_ONCE(...) do { static volatile LONG once_; if (!InterlockedExchange(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
+#define MAX_PATH 260   // the buffers keep the Windows sizes (MAX_PATH * 2) on both systems
+
+// Flushes a stdio file's data to the disk (the key file's appends must be there before the next append): 0 on success.
+static int file_commit(FILE *f) {
+#ifdef _WIN32
+    return _commit(_fileno(f));
+#else
+    return fsync(fileno(f));
+#endif
+}
+
+#define LOG_ONCE(...) do { static volatile int32_t once_; if (!__atomic_exchange_n(&once_, 1, __ATOMIC_SEQ_CST)) rt_log(__VA_ARGS__); } while (0)
 
 enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SPV_OP_TYPE_VECTOR = 23,
        SPV_OP_TYPE_POINTER = 32, SPV_OP_CONSTANT = 43, SPV_OP_CONSTANT_COMPOSITE = 44,
@@ -74,8 +87,8 @@ enum { SPV_OP_ENTRY_POINT = 15, SPV_OP_TYPE_INT = 21, SPV_OP_TYPE_FLOAT = 22, SP
 // ---- device capabilities and the pipeline cache (set up on first use, under P.lock)
 
 static struct {
-    SRWLOCK lock;
-    volatile LONG ready;
+    PlatMutex lock;
+    volatile int32_t ready;
     VkDevice device;
     VkPipelineCache cache;
     uint32_t max_push;
@@ -105,7 +118,7 @@ static struct {
     PFN_vkCmdSetAlphaToCoverageEnableEXT set_a2c;
     char cache_path[MAX_PATH * 2];
     VkPipeStats stats;
-} P = {.lock = SRWLOCK_INIT};
+} P = {.lock = PLAT_MUTEX_INIT};
 
 typedef struct Layout {
     struct Layout *next;
@@ -159,13 +172,14 @@ static void cache_path_init(void) {
         return;
     }
     P.cache_path[0] = 0;
-    char exe[MAX_PATH * 2];
-    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!n || n >= sizeof exe) return;
-    char *cut = strrchr(exe, '\\');
+    char exe[1024];
+    if (!plat_exe_path(exe, sizeof exe)) return;
+    char *cut = strrchr(exe, '/');
+    char *bs = strrchr(exe, '\\');
+    if (bs && (!cut || bs > cut)) cut = bs;   // Windows paths: either separator splits
     if (!cut) return;
     *cut = 0;
-    snprintf(P.cache_path, sizeof P.cache_path, "%s\\pipeline-cache.bin", exe);
+    snprintf(P.cache_path, sizeof P.cache_path, "%s/pipeline-cache.bin", exe);
 }
 
 // Cache data whose header names another device or driver is dropped before Vulkan sees it.
@@ -205,9 +219,9 @@ static void prebuild_start(void);
 static int ensure_init(void) {
     if (P.ready) return 1;
     if (!vk_init()) return 0;
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     if (P.ready) {
-        ReleaseSRWLockExclusive(&P.lock);
+        plat_mutex_unlock(&P.lock);
         return 1;
     }
     VkCtx *c = vk_ctx();
@@ -305,8 +319,8 @@ static int ensure_init(void) {
            P.max_push, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
            P.cache_path[0] ? P.cache_path : "<memory only>");
     keys_open();
-    InterlockedExchange(&P.ready, 1);
-    ReleaseSRWLockExclusive(&P.lock);
+    __atomic_exchange_n(&P.ready, 1, __ATOMIC_SEQ_CST);
+    plat_mutex_unlock(&P.lock);
     prebuild_start();
     return 1;
 }
@@ -617,10 +631,10 @@ PFN_vkUpdateDescriptorSetWithTemplate vk_pipeline_update_tpl_fn(void) { return e
 
 int vk_pipeline_set_indep(int on) {
     if (!ensure_init()) return 0;
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     int was = P.indep;
     P.indep = on && vk_caps.gpl;
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     return was;
 }
 
@@ -1333,12 +1347,12 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
 // fragment shader of one pipeline. Unwritten ones read (0, 0, 0, 1) as before. OOT_VS_OUTS=all declares all 32.
 #define VS_OUTS_CAP 8192
 static struct {
-    SRWLOCK lock;
+    PlatMutex lock;
     const GfxShader *vs[VS_OUTS_CAP];
     uint32_t mask[VS_OUTS_CAP];
     GfxShaderIo io[VS_OUTS_CAP][32];
     uint32_t n, full;
-} VO = {.lock = SRWLOCK_INIT};
+} VO = {.lock = PLAT_MUTEX_INIT};
 
 // Adds fs's inputs (packed ones excepted) to vs's union; returns the union, types in io (the first type met wins).
 static uint32_t vs_outs(const GfxShader *vs, const GfxShader *fs, GfxShaderIo io[32]) {
@@ -1346,12 +1360,12 @@ static uint32_t vs_outs(const GfxShader *vs, const GfxShader *fs, GfxShaderIo io
     uint32_t need = fs ? gfx_shader_inputs(fs, fin) : 0, mask;
     for (int i = 0; i < 32; i++)
         if (need >> i & 1 && fin[i].packed) need &= ~(1u << i);
-    AcquireSRWLockExclusive(&VO.lock);
+    plat_mutex_lock(&VO.lock);
     uint32_t j = (uint32_t)(((uintptr_t)vs >> 4) * 0x9e3779b1u) & (VS_OUTS_CAP - 1);
     while (VO.vs[j] && VO.vs[j] != vs) j = (j + 1) & (VS_OUTS_CAP - 1);
     if (!VO.vs[j] && VO.n + 1 >= VS_OUTS_CAP * 3 / 4) {   // full: this pair alone
         VO.full++;
-        ReleaseSRWLockExclusive(&VO.lock);
+        plat_mutex_unlock(&VO.lock);
         LOG_ONCE("vk_pipeline: vertex output union table full: outputs from the pair");
         memset(io, 0, 32 * sizeof *io);
         for (int i = 0; i < 32; i++)
@@ -1365,7 +1379,7 @@ static uint32_t vs_outs(const GfxShader *vs, const GfxShader *fs, GfxShaderIo io
         else if (VO.io[j][i].type == fin[i].type && VO.io[j][i].comps < fin[i].comps) VO.io[j][i].comps = fin[i].comps;
     mask = VO.mask[j];
     memcpy(io, VO.io[j], 32 * sizeof *io);
-    ReleaseSRWLockExclusive(&VO.lock);
+    plat_mutex_unlock(&VO.lock);
     return mask;
 }
 
@@ -1683,7 +1697,7 @@ out:
 // pipelines live until vk_pipeline_shutdown.
 // Background build signalling, both with P.lock: work_cv wakes the pipeline workers, done_cv wakes threads waiting for a
 // pipeline or a stage library to be published.
-static CONDITION_VARIABLE work_cv = CONDITION_VARIABLE_INIT, done_cv = CONDITION_VARIABLE_INIT;
+static PlatCond work_cv = PLAT_COND_INIT, done_cv = PLAT_COND_INIT;
 #define LIB_BUCKETS 1024
 enum { LIB_VI, LIB_PR, LIB_FS, LIB_FO };
 typedef struct Lib { struct Lib *next; uint64_t hash; VkPipeline pipe; uint32_t size; uint8_t pre, used, building, pad;
@@ -1698,12 +1712,8 @@ typedef struct { uint32_t kind; uint8_t dsb, samples, a2c, pad; const GfxShader 
 typedef struct { uint32_t kind; uint8_t n_color, samples, a2c, logic_op, blend_en, pad[3]; uint32_t color[8], depth, stencil, wmask;
                  uint8_t blend[8][6]; } FoKey;
 
-static uint64_t qpc(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
-static double ms_since(uint64_t t0) {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    return (double)(qpc() - t0) * 1000.0 / (double)f.QuadPart;
-}
+static uint64_t qpc(void) { return plat_now_ns(); }   // nanoseconds on the platform's monotonic clock
+static double ms_since(uint64_t t0) { return (double)(qpc() - t0) / 1e6; }
 
 static VkPipelineLayout half_layout(Layout *l, int h) {
     if (l->half[h]) return l->half[h];
@@ -1893,17 +1903,17 @@ static VkPipeline lib_build(Lib *b, int kind, const VkPipeState *s, const GKey *
     VkPipelineLayout lay = kind == LIB_PR ? half_layout(l, 0) : kind == LIB_FS ? half_layout(l, 1) : VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
     if (lay || kind == LIB_VI || kind == LIB_FO) {
-        ReleaseSRWLockExclusive(&P.lock);
+        plat_mutex_unlock(&P.lock);
         uint64_t t0 = qpc();
         pipe = lib_create(kind, s, k, lay, b->key);
         double ms = ms_since(t0);
-        AcquireSRWLockExclusive(&P.lock);
+        plat_mutex_lock(&P.lock);
         P.g.lib_n[kind]++, P.g.lib_ms[kind] += ms;
         if (ms > P.g.lib_max[kind]) P.g.lib_max[kind] = ms;
     }
     if (!pipe && ++P.g.lib_fail <= 8) rt_log("vk_pipeline: gpl: stage library %d not built", kind);
     b->pipe = pipe, b->building = 0;
-    WakeAllConditionVariable(&done_cv);
+    plat_cond_broadcast(&done_cv);
     return pipe;
 }
 
@@ -1928,7 +1938,7 @@ static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout 
             return VK_NULL_HANDLE;
         }
         if (have->job) U.stolen++, lib_steal(have);
-        else SleepConditionVariableSRW(&done_cv, &P.lock, INFINITE, 0);
+        else plat_cond_wait(&done_cv, &P.lock);
     }
     if (have) {
         if (have->pre && !have->used) have->used = 1, P.g.pre_used[kind]++;
@@ -1941,11 +1951,11 @@ static VkPipeline lib_get(int kind, const VkPipeState *s, const GKey *k, Layout 
     }
     Lib *b = lib_new(h, key, size);   // entered first, so other threads wait for this build instead of repeating it
     if (b) return lib_build(b, kind, s, k, l);
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     uint64_t t0 = qpc();
     VkPipeline pipe = lib_create(kind, s, k, lay, key);
     double ms = ms_since(t0);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     if ((have = lib_find(h, key, size)) && !have->building) {   // another thread built it meanwhile
         if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
         return have->pipe;
@@ -2019,11 +2029,11 @@ static VkPipeline gpl_link(const VkPipeState *s, const GKey *k, const Layout *lc
                                              .pLibraries = lib};
         VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li,
                                            .layout = l->layout};
-        if (build) ReleaseSRWLockExclusive(&P.lock);
+        if (build) plat_mutex_unlock(&P.lock);
         uint64_t t1 = qpc();
         if (vkCreateGraphicsPipelines(P.device, VK_NULL_HANDLE, 1, &pi, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
         double ms = ms_since(t1);   // the link alone: library builds are counted apart
-        if (build) AcquireSRWLockExclusive(&P.lock);
+        if (build) plat_mutex_lock(&P.lock);
         P.g.link_ms += ms;
         if (ms > P.g.link_max) P.g.link_max = ms;
     }
@@ -2064,14 +2074,14 @@ typedef struct Job {
 static struct {
     int on;                            // set once by vk_pipeline_async_enable, before the replay runs
     int threads;
-    HANDLE thread[MAX_WORKERS];
+    PlatThread *thread[MAX_WORKERS];
     uint8_t prio_low[MAX_WORKERS];     // worker runs below normal (under P.lock)
     Job *head, *tail;                  // draws' misses
     Job *low, *low_tail;               // prebuild
     uint32_t inflight;                 // queued or running, both queues
     int low_running;                   // pool workers running a job taken from the low queue
-    CONDITION_VARIABLE idle;           // with P.lock: no job queued or running
-} A = {.idle = CONDITION_VARIABLE_INIT};
+    PlatCond idle;           // with P.lock: no job queued or running
+} A = {.idle = PLAT_COND_INIT};
 
 // ---- pipeline keys (pipeline-keys.bin next to the pipeline cache)
 // Every graphics pipeline built in a game run appends a KeyRec: the VkPipeState it was built from with the shader
@@ -2100,14 +2110,14 @@ static struct {
     uint32_t pend_n, pend_cap;
     uint8_t *file;                     // the file as read at boot, until the prewarm is done with it
     size_t file_n;                     // records in it
-    SRWLOCK io;                        // one writer
+    PlatMutex io;                        // one writer
     // prebuild progress (under P.lock)
     int loading;                       // the prewarm still queues records
     int warm;                          // vk_pipeline_prewarm owns the file (prebuild_start leaves it)
     uint32_t left;                     // prebuild jobs queued or running
     uint32_t built, failed, promoted;
     double t0;                         // now_ms() when the prebuild started
-} K = {.io = SRWLOCK_INIT};
+} K = {.io = PLAT_MUTEX_INIT};
 
 static uint64_t rec_hash(const KeyRec *r) {
     uint64_t h = fnv(FNV0, r, sizeof *r);
@@ -2166,12 +2176,12 @@ static void keys_note(const VkPipeState *s) {
 // Appends the pending records (present thread or exit; never the render thread).
 static void keys_flush(void) {
     if (!K.path[0]) return;
-    AcquireSRWLockExclusive(&K.io);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&K.io);
+    plat_mutex_lock(&P.lock);
     KeyRec *r = K.pend;
     uint32_t n = K.pend_n;
     K.pend = NULL, K.pend_n = K.pend_cap = 0;
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     if (n) {
         FILE *f = fopen(K.path, K.header_ok ? "ab" : "wb");
         int ok = f != NULL;
@@ -2180,13 +2190,13 @@ static void keys_flush(void) {
             ok = fwrite(&h, sizeof h, 1, f) == 1;
         }
         if (ok) ok = fwrite(r, sizeof *r, n, f) == n;
-        if (ok) ok = !fflush(f) && !_commit(_fileno(f));   // appended records on the disk before the next append
+        if (ok) ok = !fflush(f) && !file_commit(f);   // appended records on the disk before the next append
         if (f) ok = !fclose(f) && ok;
         if (ok) K.header_ok = 1;
         else rt_log("vk_pipeline: cannot write %s", K.path);
     }
     free(r);
-    ReleaseSRWLockExclusive(&K.io);
+    plat_mutex_unlock(&K.io);
 }
 
 // Reads the key file into K.file and its record hashes into the set. Caller holds P.lock (ensure_init).
@@ -2222,13 +2232,8 @@ static void keys_open(void) {
     }
 }
 
-static double now_ms(void) {
-    static LARGE_INTEGER f;
-    LARGE_INTEGER t;
-    if (!f.QuadPart) QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t);
-    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
-}
+static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
+
 
 // Caller holds P.lock.
 static void prebuild_report(void) {
@@ -2236,22 +2241,22 @@ static void prebuild_report(void) {
            "ready", K.built, K.failed, K.promoted, now_ms() - K.t0);
 }
 
-static DWORD WINAPI pipe_worker(void *arg) {
+static void pipe_worker(void *arg) {
     int me = (int)(intptr_t)arg;
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     for (;;) {
         // With 3 or more workers one never takes low-queue work, so a waiting draw's library starts at once
         // (not with OOT_PIPE_WAIT=draw).
         while (!U.head && !A.head && !(A.low && (A.threads < 3 || !U.on || A.low_running < A.threads - 1))) {
             U.idle++;
-            SleepConditionVariableSRW(&work_cv, &P.lock, INFINITE, 0);
+            plat_cond_wait(&work_cv, &P.lock);
             U.idle--;
         }
         if (U.head) {   // a library a draw waits for
             LibJob *lj = U.head;
             if (!(U.head = lj->next)) U.tail = NULL;
             lj->b->job = NULL;
-            if (A.prio_low[me]) A.prio_low[me] = 0, SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+            if (A.prio_low[me]) A.prio_low[me] = 0, plat_thread_priority(NULL, PLAT_PRIO_NORMAL);
             U.by_worker++, U.running++;
             lib_build(lj->b, lj->kind, &lj->s, &lj->k, lj->l);   // releases P.lock while building
             U.running--;
@@ -2272,7 +2277,7 @@ static DWORD WINAPI pipe_worker(void *arg) {
         j->worker = me;
         if (j->low != A.prio_low[me]) {   // under P.lock, so a draw raising this thread (promote) is not undone
             A.prio_low[me] = j->low;
-            SetThreadPriority(GetCurrentThread(), j->low ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL);
+            plat_thread_priority(NULL, j->low ? PLAT_PRIO_BELOW : PLAT_PRIO_NORMAL);
         }
         // Step 1 for a job a draw waits for: its stage libraries and the fast link. Step 2, the optimised build, goes to
         // the head of the low queue, so a burst of new pipelines gets every fast link before any optimised build.
@@ -2282,7 +2287,7 @@ static DWORD WINAPI pipe_worker(void *arg) {
             j->p->fast_tried = 1;
             if (f && !j->p->info.pipeline) {
                 j->p->fast = j->p->info.pipeline = f, P.g.wlinks++;
-                WakeAllConditionVariable(&done_cv);
+                plat_cond_broadcast(&done_cv);
                 j->low = 1, j->worker = -1, P.g.requeued++;
                 j->prev = NULL, j->next = A.low;
                 if (A.low) A.low->prev = j;
@@ -2294,9 +2299,9 @@ static DWORD WINAPI pipe_worker(void *arg) {
                 vkDestroyPipeline(P.device, f, NULL);
             }
         }
-        ReleaseSRWLockExclusive(&P.lock);
+        plat_mutex_unlock(&P.lock);
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
-        AcquireSRWLockExclusive(&P.lock);
+        plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
         j->p->building = 0;
@@ -2315,21 +2320,20 @@ static DWORD WINAPI pipe_worker(void *arg) {
             if (!--K.left && !K.loading) prebuild_report();
         }
         A.low_running -= lowrun;
-        if (!--A.inflight) WakeAllConditionVariable(&A.idle);
-        WakeAllConditionVariable(&done_cv);
+        if (!--A.inflight) plat_cond_broadcast(&A.idle);
+        plat_cond_broadcast(&done_cv);
         if (pipe && (!j->prebuild || j->demanded)) perf_count(PERF_CNT_PIPE_ASYNC);   // a draw waited for it
         free(j);
     }
-    return 0;
 }
 
 // Starts the pool on first use: a quarter of the logical processors, 2 to 4. Caller holds P.lock.
 static int workers_start(void) {
     if (A.threads) return 1;
-    DWORD cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    uint32_t cpus = plat_cpu_count();
     int n = cpus / 4 < 2 ? 2 : cpus / 4 > MAX_WORKERS ? MAX_WORKERS : (int)(cpus / 4);
     for (int i = 0; i < n; i++) {
-        HANDLE t = CreateThread(NULL, 0, pipe_worker, (void *)(intptr_t)A.threads, 0, NULL);
+        PlatThread *t = plat_thread_new(pipe_worker, (void *)(intptr_t)A.threads, "vk pipe");
         if (!t) break;
         A.thread[A.threads++] = t;   // kept: promote() raises a worker running a prebuild job
     }
@@ -2339,7 +2343,7 @@ static int workers_start(void) {
 }
 
 static void workers_drain(void) {
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     K.loading = 0;
     for (Job *j = A.low, *n; j; j = n) {   // queued prebuild jobs are dropped, not built
         n = j->next;
@@ -2354,9 +2358,9 @@ static void workers_drain(void) {
         free(j);
     }
     U.head = U.tail = NULL;
-    while (A.inflight) SleepConditionVariableSRW(&A.idle, &P.lock, INFINITE, 0);
-    while (U.running) SleepConditionVariableSRW(&done_cv, &P.lock, INFINITE, 0);
-    ReleaseSRWLockExclusive(&P.lock);
+    while (A.inflight) plat_cond_wait(&A.idle, &P.lock);
+    while (U.running) plat_cond_wait(&done_cv, &P.lock);
+    plat_mutex_unlock(&P.lock);
 }
 
 void vk_pipeline_async_enable(void) {
@@ -2383,10 +2387,10 @@ static void promote(Pipe *p) {
         if (A.tail) A.tail->next = j;
         else A.head = j;
         A.tail = j;
-        WakeConditionVariable(&work_cv);
+        plat_cond_signal(&work_cv);
     } else if (A.prio_low[j->worker]) {
         A.prio_low[j->worker] = 0;
-        SetThreadPriority(A.thread[j->worker], THREAD_PRIORITY_NORMAL);
+        plat_thread_priority(A.thread[j->worker], PLAT_PRIO_NORMAL);
     }
 }
 
@@ -2442,7 +2446,7 @@ static Pipe *pipe_miss(const VkPipeState *s, const GKey *k, uint64_t h, int mode
         A.tail = j;
     }
     A.inflight++;
-    WakeConditionVariable(&work_cv);
+    plat_cond_signal(&work_cv);
     *queued = 1;
     return p;
 }
@@ -2496,7 +2500,7 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
         U.tail = j;
         U.queued++, queued++;
     }
-    if (queued) WakeAllConditionVariable(&work_cv);
+    if (queued) plat_cond_broadcast(&work_cv);
     double steal_at = now_ms() + 1.0;
     for (;;) {
         if (!b[0]->building && !b[1]->building) return;
@@ -2512,7 +2516,7 @@ static void lib_wait(const VkPipeState *s, const GKey *k, Layout *l, double end)
             continue;
         }
         double until = q && steal_at < end ? steal_at : end;
-        SleepConditionVariableSRW(&done_cv, &P.lock, (DWORD)(until - now) + 1, 0);
+        plat_cond_wait_ns(&done_cv, &P.lock, ((uint64_t)(until - now) + 1) * 1000000u);
     }
 }
 
@@ -2523,7 +2527,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
     GKey k;
     gkey_fill(s, &k);
     uint64_t h = key_hash(&k, sizeof k);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     Pipe *p = pipe_find(&k, sizeof k, h);
     int queued;
     if (p) {
@@ -2569,7 +2573,7 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         if (f && !p->info.pipeline) {
             p->fast = p->info.pipeline = f;
             job_lower(p->job);
-            WakeAllConditionVariable(&done_cv);
+            plat_cond_broadcast(&done_cv);
         } else if (f) {
             vkDestroyPipeline(P.device, f, NULL);   // a worker published one while the lock was free
         }
@@ -2579,14 +2583,14 @@ static VkPipeline graphics(const VkPipeState *s, const VkPipeInfo **info, int as
         uint64_t p0 = wait_ms ? perf_begin() : 0;   // the wait counts as the render thread's pipeline time
         double now;
         while (p->building && !p->info.pipeline && wait_ms && (now = now_ms()) < end)
-            SleepConditionVariableSRW(&done_cv, &P.lock, (DWORD)(end - now) + 1, 0);
+            plat_cond_wait_ns(&done_cv, &P.lock, ((uint64_t)(end - now) + 1) * 1000000u);
         if (wait_ms) perf_end(PERF_PIPE, p0);
         if (wait_ms && !p->building) perf_count(PERF_CNT_PIPE_WAIT);
     }
     int wait = p && p->building && !p->info.pipeline;
     if (wait) P.stats.pending_skips++;
     VkPipeline pipe = p ? p->info.pipeline : VK_NULL_HANDLE;
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     if (wait) {
         perf_count(PERF_CNT_PIPE_SKIP);
         if (pending) *pending = 1;
@@ -2610,18 +2614,18 @@ VkPipeline vk_pipeline_graphics_async(const VkPipeState *s, const VkPipeInfo **i
 static int id_cmp(const void *x, const void *y) { return memcmp(x, y, 32); }
 
 // Builds queued prebuild jobs until the low queue is empty, beside the pipe_worker pool (same bookkeeping).
-static DWORD WINAPI warm_builder(void *arg) {
+static void warm_builder(void *arg) {
     (void)arg;
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     while (A.low) {
         Job *j = A.low;
         if ((A.low = j->next)) A.low->prev = NULL;
         else A.low_tail = NULL;
         j->next = j->prev = NULL;
         j->low = 0;                    // not on a pool thread: promote() has nothing to raise
-        ReleaseSRWLockExclusive(&P.lock);
+        plat_mutex_unlock(&P.lock);
         VkPipeline pipe = create_graphics(&j->s, &j->k, j->l, j->fs_off);
-        AcquireSRWLockExclusive(&P.lock);
+        plat_mutex_lock(&P.lock);
         if (pipe || !j->p->fast) j->p->info.pipeline = pipe;   // a failed optimised build keeps the fast-linked one
         if (pipe && j->p->fast) P.g.swaps++;
         j->p->building = 0;
@@ -2634,12 +2638,11 @@ static DWORD WINAPI warm_builder(void *arg) {
         }
         K.promoted += j->demanded;
         K.left--;
-        if (!--A.inflight) WakeAllConditionVariable(&A.idle);
-        WakeAllConditionVariable(&done_cv);
+        if (!--A.inflight) plat_cond_broadcast(&A.idle);
+        plat_cond_broadcast(&done_cv);
         free(j);
     }
-    ReleaseSRWLockExclusive(&P.lock);
-    return 0;
+    plat_mutex_unlock(&P.lock);
 }
 
 static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]);
@@ -2675,7 +2678,7 @@ void vk_pipeline_prewarm(void) {
     size_t u = 0;
     for (size_t i = 0; i < m; i++)
         if (!u || memcmp(ids[u - 1], ids[i], 32)) memcpy(ids[u++], ids[i], 32);
-    int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    int cpus = (int)plat_cpu_count();
     const char *pe = cfg_get("OOT_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     gfx_shader_prewarm((const uint8_t(*)[32])ids, u, sh, cpus, procs < 1 ? 1 : procs);
@@ -2696,7 +2699,7 @@ void vk_pipeline_prewarm(void) {
                VO.n, VO.n ? (double)uni / VO.n : 0.0, (unsigned long long)pairs, pairs ? (double)pair / pairs : 0.0);
     }
     uint32_t queued = 0, dropped = 0, known = 0;
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     K.t0 = t1;
     K.loading = 1;
     for (size_t i = 0; i < n; i++) {
@@ -2719,42 +2722,37 @@ void vk_pipeline_prewarm(void) {
         else pipe_miss(&s, &k, h, 2, &q), queued += (uint32_t)q;
     }
     K.loading = 0;
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     free(ids), free(sh);
 
-    HANDLE t[64];
+    PlatThread *t[64];
     int nt = 0;
     for (int i = 0; i < cpus && i < 64 && queued; i++)
-        if ((t[nt] = CreateThread(NULL, 0, warm_builder, NULL, 0, NULL))) nt++;
+        if ((t[nt] = plat_thread_new(warm_builder, NULL, "vk prewarm"))) nt++;
     if (!nt) warm_builder(NULL);
-    for (int i = 0; i < nt; i += MAXIMUM_WAIT_OBJECTS) {
-        int c = nt - i < MAXIMUM_WAIT_OBJECTS ? nt - i : MAXIMUM_WAIT_OBJECTS;
-        while (WaitForMultipleObjects((DWORD)c, t + i, TRUE, 2000) == WAIT_TIMEOUT)
-            rt_log("vk_pipeline: prewarm: %u of %u pipelines, %.0f ms", K.built + K.failed, queued, now_ms() - t1);
-    }
-    for (int i = 0; i < nt; i++) CloseHandle(t[i]);
-    AcquireSRWLockExclusive(&P.lock);
-    while (K.left) SleepConditionVariableSRW(&done_cv, &P.lock, INFINITE, 0);   // jobs a pool worker took
+    for (int i = 0; i < nt; i++) plat_thread_join(t[i]);   // untimed: the prewarm progress lines (every 2 s) are not printed
+    plat_mutex_lock(&P.lock);
+    while (K.left) plat_cond_wait(&done_cv, &P.lock);   // jobs a pool worker took
     rt_log("vk_pipeline: prewarm: %zu records in %s: %u pipelines built, %u failed, %u already built, %u dropped "
            "(shader neither cached nor stored); shaders %.0f ms, pipelines %.0f ms on %d threads, total %.0f ms",
            n, K.path, K.built, K.failed, known, dropped, t1 - t0, now_ms() - t1, nt, now_ms() - t0);
     free(K.file);
     K.file = NULL;
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     lb_start(pr_hist, fs_hist);
 }
 
 // ensure_init's hook: without a prewarm (OOT_PIPE_PREBUILD=0, or the device came up first elsewhere) the records
 // are not built. Caller holds no lock.
 static void prebuild_start(void) {
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     if (K.file && !K.warm) {
         rt_log("vk_pipeline: prebuild off%s; %zu records not built",
                !cfg_bool("OOT_PIPE_PREBUILD") ? " (OOT_PIPE_PREBUILD=0)" : " (no boot prewarm)", K.file_n);
         free(K.file);
         K.file = NULL;
     }
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
 }
 
 // A compute pipeline for cs in layout l; VK_NULL_HANDLE on failure. No lock needed (P.cache is driver-synchronised).
@@ -2814,26 +2812,26 @@ static Layout *compute_layout(const GfxShader *cs, Bindings *B, const char **why
 static struct {
     GfxWarmEnt *e;
     size_t n;
-    volatile LONG64 next;
-    volatile LONG stop, running;
+    volatile int64_t next;
+    volatile int32_t stop, running;
     int threads;
-    HANDLE th[LB_MAX_THREADS];
+    PlatThread *th[LB_MAX_THREADS];
     uint8_t clamp, poly, minus_w, samples;             // library state (GKey fields)
     double t0, ms[3];                                  // ms: build time per kind (vertex, fragment, compute)
     uint64_t built[3], have[3], fail[3], warmed[3], noshader, done, cs_draw;   // warmed: driver cache only
     double warm_ms[3];
-    volatile LONG kept;                                // libraries entered in libs[] so far
-    LONG keep_n;
+    volatile int32_t kept;                                // libraries entered in libs[] so far
+    int32_t keep_n;
     int idle;                                          // build at THREAD_PRIORITY_IDLE (boot), normal (preparation)
-    SRWLOCK stat;
-} LB = {.stat = SRWLOCK_INIT};
+    PlatMutex stat;
+} LB = {.stat = PLAT_MUTEX_INIT};
 
 VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
     if (info) *info = NULL;
     if (!cs || !ensure_init()) return VK_NULL_HANDLE;
     struct { const GfxShader *cs; uint32_t compute; } k = {cs, 1};
     uint64_t h = key_hash(&k, sizeof k);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     Pipe *p = pipe_find(&k, sizeof k, h);
     if (p) {
         P.stats.hits++;
@@ -2857,27 +2855,27 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
         }
         p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
     }
-    ReleaseSRWLockExclusive(&P.lock);
+    plat_mutex_unlock(&P.lock);
     if (!p) return VK_NULL_HANDLE;
     if (info) *info = &p->info;
     return p->info.pipeline;
 }
 
 static void lb_lock(void) {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
-    AcquireSRWLockExclusive(&P.lock);
+    plat_thread_priority(NULL, PLAT_PRIO_NORMAL);
+    plat_mutex_lock(&P.lock);
 }
 
 static void lb_unlock(void) {
-    ReleaseSRWLockExclusive(&P.lock);
-    if (LB.idle) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    plat_mutex_unlock(&P.lock);
+    if (LB.idle) plat_thread_priority(NULL, PLAT_PRIO_IDLE);
 }
 
 static void lb_count(int kind, int what, double ms) {   // what: 0 built, 1 already there, 2 failed, 3 cache only
-    AcquireSRWLockExclusive(&LB.stat);
+    plat_mutex_lock(&LB.stat);
     if (what == 3) LB.warmed[kind]++, LB.warm_ms[kind] += ms;
     else (what == 0 ? LB.built : what == 1 ? LB.have : LB.fail)[kind]++, LB.ms[kind] += ms;
-    ReleaseSRWLockExclusive(&LB.stat);
+    plat_mutex_unlock(&LB.stat);
 }
 
 // vs_union_missing for vs alone, without entering vs into the union table (it holds VS_OUTS_CAP shaders).
@@ -2885,11 +2883,11 @@ static uint32_t vs_union_peek(const GfxShader *vs, GfxShaderIo fin[32]) {
     GfxShaderIo vout[32];
     uint32_t need = 0, have = gfx_shader_outputs(vs, vout), missing = 0;
     memset(fin, 0, 32 * sizeof *fin);
-    AcquireSRWLockShared(&VO.lock);
+    plat_mutex_lock_shared(&VO.lock);
     uint32_t j = (uint32_t)(((uintptr_t)vs >> 4) * 0x9e3779b1u) & (VS_OUTS_CAP - 1);
     while (VO.vs[j] && VO.vs[j] != vs) j = (j + 1) & (VS_OUTS_CAP - 1);
     if (VO.vs[j]) need = VO.mask[j], memcpy(fin, VO.io[j], 32 * sizeof *fin);
-    ReleaseSRWLockShared(&VO.lock);
+    plat_mutex_unlock_shared(&VO.lock);
     if (P.vs_outs_all)
         for (int i = 0; i < 32; i++)
             if (!(need >> i & 1)) fin[i] = (GfxShaderIo){GFX_TYPE_FLOAT, 4, 0}, need |= 1u << i;
@@ -2987,9 +2985,9 @@ static void lb_library(const GfxShader *sh, int vertex, int keep) {
 }
 
 static void lb_report(const char *how) {
-    PROCESS_MEMORY_COUNTERS_EX mc = {.cb = sizeof mc};
-    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&mc, sizeof mc);
-    AcquireSRWLockShared(&LB.stat);
+    double private_mb = -1, commit_used_mb, commit_limit_mb;
+    plat_commit_info(&private_mb, &commit_used_mb, &commit_limit_mb);   // this process's private bytes (commit charge)
+    plat_mutex_lock_shared(&LB.stat);
     rt_log("vk_pipeline: stage library prebuild %s: %llu of %zu variants in %.0f ms; kept: vertex %llu built (avg %.1f ms), "
            "%llu there; fragment %llu built (avg %.1f ms), %llu there; compute %llu built (avg %.1f ms), %llu there; driver "
            "cache only: vertex %llu (avg %.1f ms), fragment %llu (avg %.1f ms), compute %llu (avg %.1f ms); %llu failed, %llu not in the shader cache; "
@@ -3001,35 +2999,34 @@ static void lb_report(const char *how) {
            (unsigned long long)LB.warmed[1], LB.warmed[1] ? LB.warm_ms[1] / LB.warmed[1] : 0.0,
            (unsigned long long)LB.warmed[2], LB.warmed[2] ? LB.warm_ms[2] / LB.warmed[2] : 0.0,
            (unsigned long long)(LB.fail[0] + LB.fail[1] + LB.fail[2]),
-           (unsigned long long)LB.noshader, (double)mc.PrivateUsage / 1048576.0);
-    ReleaseSRWLockShared(&LB.stat);
+           (unsigned long long)LB.noshader, private_mb);
+    plat_mutex_unlock_shared(&LB.stat);
 }
 
 // Boot: compute pipelines and kept libraries, all entered for the process.
-static DWORD WINAPI lb_worker(void *arg) {
+static void lb_worker(void *arg) {
     (void)arg;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+    plat_thread_priority(NULL, PLAT_PRIO_IDLE);
     for (;;) {
-        size_t i = (size_t)InterlockedIncrement64(&LB.next) - 1;
+        size_t i = (size_t)__atomic_add_fetch(&LB.next, 1, __ATOMIC_SEQ_CST) - 1;
         if (i >= LB.n || LB.stop) break;
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);   // gfx_shader's cache lock, disk reads
+        plat_thread_priority(NULL, PLAT_PRIO_NORMAL);   // gfx_shader's cache lock, disk reads
         const GfxShader *sh = gfx_shader_load_input(LB.e[i].iid, 0);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
+        plat_thread_priority(NULL, PLAT_PRIO_IDLE);
         if (!sh) {
-            AcquireSRWLockExclusive(&LB.stat);
+            plat_mutex_lock(&LB.stat);
             LB.noshader++;
-            ReleaseSRWLockExclusive(&LB.stat);
+            plat_mutex_unlock(&LB.stat);
         } else if (gfx_shader_stage(sh) == GFX_STAGE_CS) {
             lb_compute(sh);
         } else if (P.gpl && (gfx_shader_stage(sh) == GFX_STAGE_VS || gfx_shader_stage(sh) == GFX_STAGE_FS)) {
             lb_library(sh, gfx_shader_stage(sh) == GFX_STAGE_VS, 1);
         }
-        AcquireSRWLockExclusive(&LB.stat);
+        plat_mutex_lock(&LB.stat);
         LB.done++;
-        ReleaseSRWLockExclusive(&LB.stat);
+        plat_mutex_unlock(&LB.stat);
     }
-    if (!InterlockedDecrement(&LB.running)) lb_report(LB.stop ? "stopped" : "done");
-    return 0;
+    if (!__atomic_sub_fetch(&LB.running, 1, __ATOMIC_SEQ_CST)) lb_report(LB.stop ? "stopped" : "done");
 }
 
 // The library state from the key file's records (prewarm); defaults without one.
@@ -3055,7 +3052,7 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     for (size_t i = 0; LB.e && i < total; i++)
         if (all[i].stage == GFX_STAGE_CS) LB.e[n++] = all[i];
     n_cs = n;
-    for (size_t i = 0; LB.e && i < total && (LONG)(n - n_cs) < LB.keep_n; i++)
+    for (size_t i = 0; LB.e && i < total && (int32_t)(n - n_cs) < LB.keep_n; i++)
         if (all[i].stage != GFX_STAGE_CS && all[i].prio == 0) LB.e[n++] = all[i];
     free(all);
     if (atoi(e) > 1 && (size_t)atoi(e) < n) n = (size_t)atoi(e);   // a count above 1 caps the list; 1 is plain on
@@ -3066,7 +3063,7 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.n = n;
     lb_state(pr_hist, fs_hist);
     LB.idle = 1;
-    int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    int cpus = (int)plat_cpu_count();
     int t = te && *te ? atoi(te) : cpus / 4;
     t = t < 1 ? 1 : t > LB_MAX_THREADS ? LB_MAX_THREADS : t;
     if ((size_t)t > n) t = (int)n;
@@ -3074,35 +3071,35 @@ static void lb_start(const uint32_t pr_hist[16], const uint32_t fs_hist[4]) {
     LB.running = t;
     int started = 0;
     for (int i = 0; i < t; i++)
-        if ((LB.th[started] = CreateThread(NULL, 0, lb_worker, NULL, 0, NULL))) started++;
-    InterlockedAdd(&LB.running, started - t);
+        if ((LB.th[started] = plat_thread_new(lb_worker, NULL, "vk libs"))) started++;
+    __atomic_add_fetch(&LB.running, started - t, __ATOMIC_SEQ_CST);
     LB.threads = started;
     rt_log("vk_pipeline: stage library prebuild: %zu compute pipelines and %zu recorded variants' libraries "
            "(OOT_LIB_PREBUILD_KEEP %ld) on %d idle-priority threads; library state clamp %u, polygon mode %u, depth "
-           "-w..w %u, samples %u", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, LB.keep_n, started, LB.clamp, LB.poly,
+           "-w..w %u, samples %u", n_cs < n ? n_cs : n, n > n_cs ? n - n_cs : 0, (long)LB.keep_n, started, LB.clamp, LB.poly,
            LB.minus_w, LB.samples);
 }
 
 static void lb_stop(void) {
-    InterlockedExchange(&LB.stop, 1);
+    __atomic_exchange_n(&LB.stop, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < LB.threads; i++)
-        if (LB.th[i]) WaitForSingleObject(LB.th[i], INFINITE), CloseHandle(LB.th[i]), LB.th[i] = NULL;
+        if (LB.th[i]) plat_thread_join(LB.th[i]), LB.th[i] = NULL;
     LB.threads = 0;
 }
 
 // Preparation: one prepared variant at a time into the driver's disk cache (private shader copy, nothing kept).
-static DWORD WINAPI lb_warm_worker(void *arg) {
+static void lb_warm_worker(void *arg) {
     (void)arg;
     for (;;) {
-        size_t i = (size_t)InterlockedIncrement64(&LB.next) - 1;
-        if (i >= LB.n) return 0;
+        size_t i = (size_t)__atomic_add_fetch(&LB.next, 1, __ATOMIC_SEQ_CST) - 1;
+        if (i >= LB.n) return;
         int owned = 0;
         const GfxShader *sh = gfx_shader_load_private(LB.e[i].iid, &owned);
         int st = sh ? gfx_shader_stage(sh) : -1;
         if (!sh) {
-            AcquireSRWLockExclusive(&LB.stat);
+            plat_mutex_lock(&LB.stat);
             LB.noshader++;
-            ReleaseSRWLockExclusive(&LB.stat);
+            plat_mutex_unlock(&LB.stat);
         } else if (st == GFX_STAGE_CS) {
             Bindings B = {0};
             const char *why = NULL;
@@ -3117,9 +3114,9 @@ static DWORD WINAPI lb_warm_worker(void *arg) {
             lb_library(sh, st == GFX_STAGE_VS, 0);
         }
         if (owned) gfx_shader_release_private(sh);
-        AcquireSRWLockExclusive(&LB.stat);
+        plat_mutex_lock(&LB.stat);
         uint64_t d = ++LB.done;
-        ReleaseSRWLockExclusive(&LB.stat);
+        plat_mutex_unlock(&LB.stat);
         if (d % 4000 == 0) lb_report("preparation progress");
     }
 }
@@ -3139,14 +3136,12 @@ static void lb_warm_prepared(const char *dir) {
     LB.n = n, LB.idle = 0, LB.t0 = now_ms();
     static const uint32_t no_pr[16], no_fs[4];
     lb_state(no_pr, no_fs);
-    int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), k = 0;
-    HANDLE t[64];
+    int cpus = (int)plat_cpu_count(), k = 0;
+    PlatThread *t[64];
     for (int i = 0; i < cpus && i < 64; i++)
-        if ((t[k] = CreateThread(NULL, 0, lb_warm_worker, NULL, 0, NULL))) k++;
+        if ((t[k] = plat_thread_new(lb_warm_worker, NULL, "vk warm"))) k++;
     if (!k) lb_warm_worker(NULL);
-    for (int i = 0; i < k; i += MAXIMUM_WAIT_OBJECTS)
-        WaitForMultipleObjects((DWORD)(k - i < MAXIMUM_WAIT_OBJECTS ? k - i : MAXIMUM_WAIT_OBJECTS), t + i, TRUE, INFINITE);
-    for (int i = 0; i < k; i++) CloseHandle(t[i]);
+    for (int i = 0; i < k; i++) plat_thread_join(t[i]);
     lb_report("preparation done");
     printf("prepare-shaders: %zu variants built into the driver cache on %d threads in %.0f ms\n", n, k, now_ms() - LB.t0);
     free(LB.e), LB.e = NULL, LB.n = 0, LB.next = 0, LB.done = 0;
@@ -3165,7 +3160,7 @@ int vk_pipeline_prepare_shaders(void) {
     char *cut = strrchr(dir, '\\');
     if (!cut) return 1;
     *cut = 0;
-    int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    int cpus = (int)plat_cpu_count();
     const char *pe = cfg_get("OOT_PREWARM_XLATE");   // no fixed default: half the CPUs, at most 16, when unset
     int procs = pe && *pe ? atoi(pe) : cpus / 2 > 16 ? 16 : cpus / 2;
     int rc = gfx_shader_prepare_seed(dir, cpus, procs < 1 ? 1 : procs);
@@ -3189,7 +3184,7 @@ int vk_pipeline_warm_shaders(void) {
     *cut = 0;
     char prp[MAX_PATH * 2 + 32];
     snprintf(prp, sizeof prp, "%s\\shader-prepared.bin", dir);
-    if (GetFileAttributesA(prp) == INVALID_FILE_ATTRIBUTES) {
+    if (!plat_file_exists(prp)) {
         fprintf(stderr, "warm-shaders: no %s (tools/prepare_shaders.py writes it)\n", prp);
         return 1;
     }
@@ -3255,12 +3250,12 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
 // ---- statistics, persistence, teardown
 
 void vk_pipeline_stats(VkPipeStats *s) {
-    AcquireSRWLockShared(&P.lock);
+    plat_mutex_lock_shared(&P.lock);
     *s = P.stats;
-    ReleaseSRWLockShared(&P.lock);
+    plat_mutex_unlock_shared(&P.lock);
 }
 
-static SRWLOCK save_lock = SRWLOCK_INIT;   // one cache save at a time; shutdown takes it to destroy the cache
+static PlatMutex save_lock = PLAT_MUTEX_INIT;   // one cache save at a time; shutdown takes it to destroy the cache
 
 void vk_pipeline_save(void) {
     if (P.ready) keys_flush();
@@ -3291,9 +3286,9 @@ void vk_pipeline_save(void) {
     if (!P.ready || !P.cache || !P.cache_path[0]) return;
     // Not under P.lock: the driver synchronises P.cache, and holding P.lock through the copy and the file write (about
     // 60 ms on the 1.4.3 fight) stopped every pipeline lookup of the replay, a freeze at each 20 s autosave.
-    AcquireSRWLockExclusive(&save_lock);
+    plat_mutex_lock(&save_lock);
     if (!P.cache) {   // vk_pipeline_shutdown destroyed it
-        ReleaseSRWLockExclusive(&save_lock);
+        plat_mutex_unlock(&save_lock);
         return;
     }
     size_t size = 0;
@@ -3303,7 +3298,7 @@ void vk_pipeline_save(void) {
         if (!plat_file_write_atomic(P.cache_path, data, size)) rt_log("vk_pipeline: cannot write %s", P.cache_path);
     }
     free(data);
-    ReleaseSRWLockExclusive(&save_lock);
+    plat_mutex_unlock(&save_lock);
 }
 
 // The game never shuts the device down (boot.c and the window end the process), so the cache is saved while it
@@ -3311,7 +3306,7 @@ void vk_pipeline_save(void) {
 static void autosave_once(void) {
     static uint64_t last_n, last_ms, last_keys;
     if (!P.ready) return;
-    uint64_t now = GetTickCount64();
+    uint64_t now = plat_tick_ms();
     if (*(volatile uint32_t *)&K.pend_n && now - last_keys >= 2000) last_keys = now, keys_flush();
     gfx_shader_record_flush(0);
     if (now - last_ms < 20000) return;
@@ -3324,19 +3319,19 @@ static void autosave_once(void) {
 
 // On its own thread: the save (vkGetPipelineCacheData and the file write, about 60 ms) and the key appends (a flush to
 // the disk each) ran on the present thread, and the render thread waited for it to take the next frame.
-static DWORD WINAPI autosave_main(void *arg) {
+static void autosave_main(void *arg) {
     (void)arg;
     for (;;) {
-        Sleep(500);
+        plat_sleep_ns(500 * 1000000ull);
         autosave_once();
     }
 }
 
 void vk_pipeline_autosave(void) {
-    static LONG started;
-    if (!P.ready || InterlockedExchange(&started, 1)) return;
-    HANDLE t = CreateThread(NULL, 0, autosave_main, NULL, 0, NULL);
-    if (t) SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL), CloseHandle(t);
+    static int32_t started;
+    if (!P.ready || __atomic_exchange_n(&started, 1, __ATOMIC_SEQ_CST)) return;
+    PlatThread *t = plat_thread_new(autosave_main, NULL, "vk autosave");
+    if (t) plat_thread_priority(t, PLAT_PRIO_BELOW), plat_thread_detach(t);
     else rt_log("vk_pipeline: cannot start the autosave thread; the cache is saved at exit only");
 }
 
@@ -3345,7 +3340,7 @@ void vk_pipeline_shutdown(void) {
     lb_stop();
     workers_drain();   // jobs point at layouts and Pipe entries freed below
     vk_pipeline_save();
-    AcquireSRWLockExclusive(&P.lock);
+    plat_mutex_lock(&P.lock);
     vkDeviceWaitIdle(P.device);
     for (int i = 0; i < PIPE_BUCKETS; i++) {
         for (Pipe *p = pipes[i], *n; p; p = n) {
@@ -3371,13 +3366,13 @@ void vk_pipeline_shutdown(void) {
         }
         layouts[i] = NULL;
     }
-    AcquireSRWLockExclusive(&save_lock);   // not while the autosave thread copies it
+    plat_mutex_lock(&save_lock);   // not while the autosave thread copies it
     if (P.cache) vkDestroyPipelineCache(P.device, P.cache, NULL);
     P.cache = VK_NULL_HANDLE;
-    ReleaseSRWLockExclusive(&save_lock);
+    plat_mutex_unlock(&save_lock);
     memset(&P.stats, 0, sizeof P.stats);
-    InterlockedExchange(&P.ready, 0);
-    ReleaseSRWLockExclusive(&P.lock);
+    __atomic_exchange_n(&P.ready, 0, __ATOMIC_SEQ_CST);
+    plat_mutex_unlock(&P.lock);
 }
 
 // ---- self-test: census shaders (build/v131072/shaders, tools/shader_census.py) through gfx_shader_get into pipelines.
@@ -3478,15 +3473,20 @@ static const GfxShader *census_shader(const char *root, const CensusEntry *e) {
     return s;
 }
 
+// The last path separator of s, either kind (Windows executables have backslashes): NULL when there is none.
+static char *last_sep(const char *s) {
+    char *a = strrchr(s, '/'), *b = strrchr(s, '\\');
+    return !a ? b : !b ? a : a > b ? a : b;
+}
+
 static int census_root(char *root, size_t n) {
     char exe[MAX_PATH * 2];
-    DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!len || len >= sizeof exe) return 0;
-    for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
+    if (!plat_exe_path(exe, sizeof exe)) return 0;
+    for (char *cut = last_sep(exe); cut; cut = last_sep(exe)) {
         *cut = 0;
         char p[MAX_PATH * 2 + 40];
-        snprintf(p, sizeof p, "%s\\build\\v131072\\shaders\\programs.json", exe);
-        if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return snprintf(root, n, "%s", exe) < (int)n;
+        snprintf(p, sizeof p, "%s/build/v131072/shaders/programs.json", exe);
+        if (plat_file_exists(p)) return snprintf(root, n, "%s", exe) < (int)n;
     }
     return 0;
 }

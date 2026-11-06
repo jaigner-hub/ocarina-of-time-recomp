@@ -33,7 +33,8 @@
 // frame a buffer of width*height*3/2 bytes and reads the planes back by GetBuffer and GetPixelPlaneFilledDataSize, so
 // the planes are laid out in that buffer one after the other; it asks for planes 0 and 1 only (run-66), so Y, then
 // U and V interleaved (NV12, tight rows).
-#include <windows.h>
+#include <stdatomic.h>
+#include "platform/platform.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +42,9 @@
 
 #include <dav1d/dav1d.h>
 
+#include "platform/platform.h"
 #include "dispatch.h"
+#include "cfg.h"
 #include "host.h"
 
 #define MAX_DECODERS 8
@@ -81,17 +84,17 @@ typedef struct {
     int skip, skip_sent, skip_end;       // OOT_MOVIE_SKIP: the last picture and the end once the game sent its end
                                          // buffer (skip_sent: 1 the picture handed back, 2 the end too)
     int64_t skip_pts;                    // the last sample's time stamp, for that end frame
-    HANDLE worker;                       // the host thread that runs dav1d (decode_thread)
-    CONDITION_VARIABLE wake;             // under lock: a sample queued, a ring slot freed, or quit
-    SRWLOCK dav_lock;                    // held around every dav1d call
+    PlatThread *worker;                  // the host thread that runs dav1d (decode_thread)
+    PlatCond wake;             // under lock: a sample queued, a ring slot freed, or quit
+    PlatMutex dav_lock;                    // held around every dav1d call
     int quit;
     uint32_t gen;                        // bumped by Stop/Flush/close: pictures decoded before it are discarded
 } Dec;
 
 static Dec decs[MAX_DECODERS];
-static SRWLOCK lock = SRWLOCK_INIT;
+static PlatMutex lock = PLAT_MUTEX_INIT;
 static struct { uint64_t create_event, signal_event, set_plane, set_ts, video_eos, audio_eos; } G;
-static volatile LONG g_ready;
+static atomic_int g_ready;
 
 static uint64_t need(const char *name) {
     uint64_t a = ldr_symbol(name);
@@ -100,8 +103,8 @@ static uint64_t need(const char *name) {
 }
 
 static void guest_init(void) {
-    if (g_ready) return;
-    AcquireSRWLockExclusive(&lock);
+    if (atomic_load(&g_ready)) return;
+    plat_mutex_lock(&lock);
     if (!g_ready) {
         G.create_event = need("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
         G.signal_event = need("_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE");
@@ -109,9 +112,9 @@ static void guest_init(void) {
         G.set_ts = need("_ZN5movie10VideoFrame12SetTimeStampEN2nn8TimeSpanE");
         G.video_eos = need("_ZN5movie10VideoFrame19SetEndOfStreamStateEb");
         G.audio_eos = need("_ZN5movie10AudioFrame19SetEndOfStreamStateEb");
-        InterlockedExchange(&g_ready, 1);
+        atomic_store(&g_ready, 1);
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 #define U(x) ((uint64_t)(uintptr_t)(x))
@@ -151,11 +154,11 @@ static void queue_clear(Dec *d) {
 static void dav_close(Dec *d) {
     if (d->worker) {
         d->quit = 1, d->gen++;
-        WakeAllConditionVariable(&d->wake);
-        ReleaseSRWLockExclusive(&lock);
-        WaitForSingleObject(d->worker, INFINITE);
-        AcquireSRWLockExclusive(&lock);
-        CloseHandle(d->worker), d->worker = NULL;
+        plat_cond_broadcast(&d->wake);
+        plat_mutex_unlock(&lock);
+        plat_thread_join(d->worker);
+        plat_mutex_lock(&lock);
+        d->worker = NULL;
     }
     ready_clear(d);
     queue_clear(d);
@@ -163,11 +166,11 @@ static void dav_close(Dec *d) {
     free(d->config), d->config = NULL, d->config_len = 0;
 }
 
-static DWORD WINAPI decode_thread(void *arg);
+static void decode_thread(void *arg);
 
 static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
     guest_init();
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     Dec *d = find(guest);
     if (!d) d = find(0);
     if (d) {
@@ -187,7 +190,7 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
                                 "the game has sent all samples", opened, from);
         }
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (!d) { rt_log("movie22: more than %d decoders alive", MAX_DECODERS); return NULL; }
     if (!d->ev_in) d->ev_in = event_new(c), d->ev_out = event_new(c), d->ev_fmt = event_new(c);
     if (video) {
@@ -195,11 +198,17 @@ static Dec *open_dec(Cpu *c, uint64_t guest, int video) {
         dav1d_default_settings(&s);
         s.n_threads = 4;
         s.max_frame_delay = 1;           // every sample's picture comes out at once: the game paces by time stamps
+        // Tuning (Linux test runs): OOT_MOVIE_THREADS, OOT_MOVIE_DELAY, OOT_MOVIE_GRAIN=0 (no film grain synthesis).
+        const char *e;
+        if ((e = cfg_get("OOT_MOVIE_THREADS")) && atoi(e) > 0) s.n_threads = atoi(e);
+        if ((e = cfg_get("OOT_MOVIE_DELAY")) && atoi(e) > 0) s.max_frame_delay = atoi(e);
+        if ((e = cfg_get("OOT_MOVIE_GRAIN")) && *e) s.apply_grain = atoi(e) != 0;
+        rt_log("movie22: dav1d %d threads, frame delay %d, film grain %d", s.n_threads, s.max_frame_delay, s.apply_grain);
         int r = dav1d_open(&d->dav, &s);
         if (r) rt_log("movie22: dav1d_open failed (%d): the cinematic shows no picture", r);
-        InitializeConditionVariable(&d->wake);
-        InitializeSRWLock(&d->dav_lock);
-        if (d->dav && !(d->worker = CreateThread(NULL, 0, decode_thread, d, 0, NULL)))
+        plat_cond_init(&d->wake);
+        plat_mutex_init(&d->dav_lock);
+        if (d->dav && !(d->worker = plat_thread_new(decode_thread, d, "movie22")))
             rt_fatal("movie22: the decoding thread did not start");
     }
     return d;
@@ -209,10 +218,10 @@ static void ov_ctor(Cpu *c) { (void)c; }                       // the object's f
 static void ov_ok(Cpu *c) { ret_x(c, 0); }
 
 static void init_common(Cpu *c, int video) {
-    static volatile LONG said;
+    static atomic_long said;
     uint64_t self = arg_x(c, 0), work = arg_x(c, 1), size = arg_x(c, 2), mime = arg_x(c, 3), fmt = arg_x(c, 4), mode = arg_x(c, 5);
     Dec *d = open_dec(c, self, video);   // its rt_calls clobber x0-x7: the arguments were read above
-    if (InterlockedIncrement(&said) <= 4)
+    if ((atomic_fetch_add(&said, 1) + 1) <= 4)
         rt_log("movie22: %s decoder %#llx (work memory %#llx, %llu bytes; mime %llu, output format %llu, codec mode %llu): %s",
                video ? "video" : "audio", (unsigned long long)self, (unsigned long long)work, (unsigned long long)size,
                (unsigned long long)mime, (unsigned long long)fmt, (unsigned long long)mode,
@@ -250,16 +259,16 @@ static void ov_finalize(Cpu *c) {
         rt_log("movie22: %s decoder %#llx finalized: %llu buffers taken, %llu frames handed back, %llu pictures dropped",
                d->video ? "video" : "audio", (unsigned long long)d->guest, (unsigned long long)d->decoded,
                (unsigned long long)d->acquired, (unsigned long long)d->dropped);
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         dav_close(d);
         d->guest = 0;
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
     }
     ret_x(c, 0);
 }
 static void ov_dtor(Cpu *c) {
     Dec *d = find(arg_x(c, 0));
-    if (d) { AcquireSRWLockExclusive(&lock); dav_close(d); d->guest = 0; ReleaseSRWLockExclusive(&lock); }
+    if (d) { plat_mutex_lock(&lock); dav_close(d); d->guest = 0; plat_mutex_unlock(&lock); }
 }
 
 // The event getters: SystemEventType **out.
@@ -298,17 +307,17 @@ static void ov_stop(Cpu *c) {
         rt_log("movie22: Stop/Flush of the %s decoder %#llx after %llu buffers in, %llu frames handed back, %d ready, "
                "%d queued", d->video ? "video" : "audio", (unsigned long long)d->guest, (unsigned long long)d->decoded,
                (unsigned long long)d->acquired, d->rcount, d->qcount);
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         d->started = 0;
         d->gen++;                                            // a picture the worker is decoding now is discarded
         ready_clear(d);
         queue_clear(d);
         d->clock_ns = 0;                                     // the next picture restarts the playback clock
-        ReleaseSRWLockExclusive(&lock);
-        AcquireSRWLockExclusive(&d->dav_lock);
+        plat_mutex_unlock(&lock);
+        plat_mutex_lock(&d->dav_lock);
         if (d->dav) dav1d_flush(d->dav);
         d->config_sent = 0;
-        ReleaseSRWLockExclusive(&d->dav_lock);
+        plat_mutex_unlock(&d->dav_lock);
     }
     ret_x(c, 0);
 }
@@ -318,11 +327,11 @@ static void ov_register(Cpu *c) {                            // RegisterVideoFra
     const uint64_t *frames = arg_p(c, 1);
     int n = (int)arg_x(c, 2);
     if (d && frames && n > 0) {
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         d->nframes = 0;
         for (int i = 0; i < n && i < MAX_FRAMES; i++) if (frames[i]) d->frames[d->nframes++] = frames[i];
         d->busy = 0;
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         if (d->warned < 2) d->warned = 2, rt_log("movie22: %d %s frames registered", d->nframes, d->video ? "video" : "audio");
     }
     ret_x(c, 0);
@@ -381,19 +390,19 @@ static Ready *ring_push(Dec *d) {                            // lock held
 // queued samples while the ring has room, decodes them outside the ring lock, puts their pictures in the ring and
 // signals the output event (a kernel event, see event_new). A Stop or Flush meanwhile bumps gen: the pictures of a
 // sample taken before it are discarded.
-static DWORD WINAPI decode_thread(void *arg) {
+static void decode_thread(void *arg) {
     Dec *d = arg;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     while (!d->quit) {
-        if (!d->qcount || !room(d)) { SleepConditionVariableSRW(&d->wake, &lock, INFINITE, 0); continue; }
+        if (!d->qcount || !room(d)) { plat_cond_wait(&d->wake, &lock); continue; }
         Sample q = d->queue[d->qhead];
         d->qhead = (d->qhead + 1) % d->qcap, d->qcount--;
         uint32_t gen = d->gen;
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         Out o;
         o.n = 0;
         uint64_t t0 = rt_ticks();
-        AcquireSRWLockExclusive(&d->dav_lock);
+        plat_mutex_lock(&d->dav_lock);
         if (gen == *(volatile uint32_t *)&d->gen) {
             if (q.eos) {
                 drain(d, &o);
@@ -404,10 +413,10 @@ static DWORD WINAPI decode_thread(void *arg) {
                 send_data(d, &o, q.data, q.size, q.ts);
             }
         }
-        ReleaseSRWLockExclusive(&d->dav_lock);
+        plat_mutex_unlock(&d->dav_lock);
         uint64_t dt = (rt_ticks() - t0) * 625 / 12;
         free(q.data);
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         d->decode_ns += dt;
         int fresh = gen == d->gen;
         for (int i = 0; i < o.n; i++) {
@@ -417,17 +426,17 @@ static DWORD WINAPI decode_thread(void *arg) {
         if (fresh && q.eos) ring_push(d)->eos = 1;
         if (fresh && d->rcount && d->ev_out) {
             const uint8_t *ev = d->ev_out;
-            ReleaseSRWLockExclusive(&lock);
+            plat_mutex_unlock(&lock);
             kern_signal_system_event(U(ev));
-            AcquireSRWLockExclusive(&lock);
+            plat_mutex_lock(&lock);
         }
     }
-    ReleaseSRWLockExclusive(&lock);
-    return 0;
+    plat_mutex_unlock(&lock);
+    return;
 }
 
 // Lock held: the decoding thread looks at the queue again (a sample queued or a ring slot freed).
-static void pump(Dec *d) { if (d->worker) WakeConditionVariable(&d->wake); }
+static void pump(Dec *d) { if (d->worker) plat_cond_signal(&d->wake); }
 
 static int enqueue(Dec *d, const uint8_t *p, size_t n, int64_t ts, int eos) {   // lock held
     if (d->qcount == d->qcap) {
@@ -456,9 +465,9 @@ static void ov_decode(Cpu *c) {                              // DecodeAsync(cons
     d->decoded++;
     int eos = (flags & FLAG_END_OF_STREAM) != 0;
     if (flags || !size) {
-        static volatile LONG said;
+        static atomic_long said;
         const uint8_t *p = (const uint8_t *)(uintptr_t)data;
-        if (InterlockedIncrement(&said) <= 12 || !size || (flags & ~FLAG_STREAM_START))   // ends and odd flags: always
+        if ((atomic_fetch_add(&said, 1) + 1) <= 12 || !size || (flags & ~FLAG_STREAM_START))   // ends and odd flags: always
             rt_log("movie22: %s buffer %llu: flags %#x, %llu bytes, pts %lld ns%s%s", d->video ? "video" : "audio",
                    (unsigned long long)d->decoded, flags, (unsigned long long)size, (long long)ts, eos ? " (end of stream)" : "",
                    size >= 4 && p ? "" : " (empty)");
@@ -471,14 +480,14 @@ static void ov_decode(Cpu *c) {                              // DecodeAsync(cons
         event_signal(c, d->ev_in);
         if (d->skip_end) event_signal(c, d->ev_out);
     } else if (d->video) {
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         if ((data && size) || eos) {
             if (!enqueue(d, (const uint8_t *)(uintptr_t)data, (size_t)(data ? size : 0), ts, eos) && d->warned < 3)
                 d->warned = 3, rt_log("movie22: out of memory queueing a %llu-byte sample", (unsigned long long)size);
         }
         pump(d);
         int have = d->rcount > 0;
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         event_signal(c, d->ev_in);
         if (have) event_signal(c, d->ev_out);
     } else {
@@ -573,9 +582,9 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
         ret_x(c, 0);
         return;
     }
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     int i = free_frame(d);
-    if (!d->rcount || i < 0) { ReleaseSRWLockExclusive(&lock); ret_x(c, MOVIE_R_NO_FRAME); return; }
+    if (!d->rcount || i < 0) { plat_mutex_unlock(&lock); ret_x(c, MOVIE_R_NO_FRAME); return; }
     // The game takes one picture per game frame and does not look at the time stamps, so below 60 fps the movie
     // played slower (a third of its speed at 20 fps, run-196). Pictures whose successor is already due by the
     // playback clock are skipped (as far as the ring reaches); end-of-stream entries are never skipped.
@@ -599,7 +608,7 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     }
     pump(d);                                                 // the slot taken makes room for a queued sample
     int have = d->rcount > 0;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (have) event_signal(c, d->ev_out);                    // more pictures wait (the event clears on each wait)
     uint64_t frame = d->frames[i];
     if (r.eos) {
@@ -613,12 +622,13 @@ static void acquire(Cpu *c, int with_index) {               // Acquire{Video,Aud
     *out = frame;
     if (index) *index = i;
     d->acquired++;
+    if (d->acquired == 1) rt_log("movie22: first picture handed back at %.3f s (pts %lld ns)", rt_uptime_s(), (long long)d->last_pts);
     if (!r.eos && d->acquired % 300 == 0) {                  // playback speed: time stamps against host time
         now = rt_ticks() * 625 / 12;
         if (d->pace_ns && d->last_pts > d->pace_pts)
-            rt_log("movie22: pacing: %llu pictures handed back; the last 300 cover %.2f s of video in %.2f s, %llu "
+            rt_log("movie22: pacing at %.2f s: %llu pictures handed back; the last 300 cover %.2f s of video in %.2f s, %llu "
                    "skipped, %.1f ms of decoding (on the decoding thread) per picture handed back",
-                   (unsigned long long)d->acquired, (d->last_pts - d->pace_pts) / 1e9, (now - d->pace_ns) / 1e9,
+                   rt_uptime_s(), (unsigned long long)d->acquired, (d->last_pts - d->pace_pts) / 1e9, (now - d->pace_ns) / 1e9,
                    (unsigned long long)(d->skipped - d->pace_skipped), (d->decode_ns - d->pace_decode_ns) / 300e6);
         d->pace_pts = d->last_pts, d->pace_ns = now, d->pace_skipped = d->skipped, d->pace_decode_ns = d->decode_ns;
     }
@@ -636,10 +646,10 @@ static void ov_release(Cpu *c) {                             // Release{Video,Au
     Dec *d = find(arg_x(c, 0));
     uint64_t frame = arg_x(c, 1);
     if (d) {
-        AcquireSRWLockExclusive(&lock);
+        plat_mutex_lock(&lock);
         for (int i = 0; i < d->nframes; i++) if (d->frames[i] == frame) d->busy &= ~(1u << i);
         int have = d->video && d->rcount > 0;
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         if (getenv("OOT_MQ_LOG")) {
             char t[96];
             rt_log("movie22: frame %#llx released by %s (%d ready, busy %#x)", (unsigned long long)frame, kern_thread_describe(t, sizeof t), d->rcount, d->busy);
@@ -681,23 +691,23 @@ static void obs_get_string(Cpu *c) {
 static void obs_plane_size(Cpu *c) {
     uint64_t frame = arg_x(c, 0), out = arg_x(c, 1), plane = arg_x(c, 2);
     uint64_t r = rt_original(c);
-    static volatile LONG n;
-    if (InterlockedIncrement(&n) <= 6)
+    static atomic_long n;
+    if ((atomic_fetch_add(&n, 1) + 1) <= 6)
         rt_log("movie22: GetPixelPlaneFilledDataSize(frame %#llx, plane %llu) -> %llu, %llu bytes", (unsigned long long)frame,
                (unsigned long long)plane, (unsigned long long)r, out ? (unsigned long long)LD64(out) : 0);
 }
 static void obs_storage_type(Cpu *c) {
     uint64_t frame = arg_x(c, 0), type = arg_x(c, 1);
     uint64_t r = rt_original(c);
-    static volatile LONG n;
-    if (InterlockedIncrement(&n) <= 2)
+    static atomic_long n;
+    if ((atomic_fetch_add(&n, 1) + 1) <= 2)
         rt_log("movie22: SetPixelStorageType(frame %#llx, %llu) -> %llu", (unsigned long long)frame, (unsigned long long)type, (unsigned long long)r);
 }
 static void obs_set_buffer(Cpu *c) {
     uint64_t frame = arg_x(c, 0), buf = arg_x(c, 1), size = arg_x(c, 2);
     uint64_t r = rt_original(c);
-    static volatile LONG n;
-    if (InterlockedIncrement(&n) <= 2)
+    static atomic_long n;
+    if ((atomic_fetch_add(&n, 1) + 1) <= 2)
         rt_log("movie22: VideoFrame::SetBuffer(frame %#llx, %#llx, %llu bytes) -> %llu", (unsigned long long)frame,
                (unsigned long long)buf, (unsigned long long)size, (unsigned long long)r);
 }

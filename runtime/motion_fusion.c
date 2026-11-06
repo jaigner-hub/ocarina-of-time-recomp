@@ -13,7 +13,7 @@
 // gyro's bias. The newest MOTION_RING samples are kept; reads are newest first. A restart (StartSixAxisSensor) drops
 // the samples before it: reads return nothing until the next sample, which starts a fresh frame and angle; sampling
 // numbers go on. The feeding thread writes, guest threads read, both under the instance's SRW lock.
-#include <windows.h>
+#include "platform/platform.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +25,7 @@ enum { MOTION_RING = 64 };
 #define STALE_NS 200000000ull   // no sample for 200 ms: no motion
 
 struct MotionFusion {
-    SRWLOCK lock;
+    PlatMutex lock;
     MotionState ring[MOTION_RING];
     uint64_t produced, last_ns;
     uint64_t first;   // produced at the last restart: older samples are not read
@@ -37,19 +37,22 @@ struct MotionFusion {
 MotionFusion *motion_new(void) {
     MotionFusion *m = calloc(1, sizeof *m);
     if (!m) rt_fatal("motion: out of memory");
-    InitializeSRWLock(&m->lock);
+    plat_mutex_init(&m->lock);
     m->restart = 1;
     return m;
 }
 
 MotionFusion *motion_global(void) {
     static MotionFusion *g;
-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    BOOL pending;
-    if (InitOnceBeginInitialize(&once, 0, &pending, NULL) && pending) {
+    static PlatMutex once_lock = PLAT_MUTEX_INIT;   // callers wait for the first one to finish, as InitOnce did
+    static int done;
+    if (__atomic_load_n(&done, __ATOMIC_ACQUIRE)) return g;
+    plat_mutex_lock(&once_lock);
+    if (!done) {
         g = motion_new();
-        InitOnceComplete(&once, 0, NULL);
+        __atomic_store_n(&done, 1, __ATOMIC_RELEASE);
     }
+    plat_mutex_unlock(&once_lock);
     return g;
 }
 
@@ -109,7 +112,7 @@ static void integrate(double R[3][3], const double gyro[3], const double acc[3],
 }
 
 void motion_feed(MotionFusion *m, const double acc[3], const double gyro[3], uint64_t now) {
-    AcquireSRWLockExclusive(&m->lock);
+    plat_mutex_lock(&m->lock);
     double dt = m->last_ns && now > m->last_ns ? (double)(now - m->last_ns) / 1e9 : 0.004;
     if (dt > 0.05) dt = 0.004;   // a gap (no controller, sensors were off): no integration across it
     m->last_ns = now;
@@ -129,27 +132,27 @@ void motion_feed(MotionFusion *m, const double acc[3], const double gyro[3], uin
         for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)m->R[j][i];   // direction i = controller axis i in the reference frame
     }
     m->produced++;
-    ReleaseSRWLockExclusive(&m->lock);
+    plat_mutex_unlock(&m->lock);
 }
 
 int motion_read(MotionFusion *m, MotionState *out, int max, uint64_t now) {
     if (max <= 0) return 0;
     int n = 0;
-    AcquireSRWLockShared(&m->lock);
+    plat_mutex_lock_shared(&m->lock);
     if (m->produced > m->first && (now < m->last_ns || now - m->last_ns < STALE_NS)) {
         uint64_t have = m->produced - m->first < MOTION_RING ? m->produced - m->first : MOTION_RING;
         n = (int)(have < (uint64_t)max ? have : (uint64_t)max);
         for (int i = 0; i < n; i++) out[i] = m->ring[(m->produced - 1 - (uint64_t)i) % MOTION_RING];
     }
-    ReleaseSRWLockShared(&m->lock);
+    plat_mutex_unlock_shared(&m->lock);
     return n;
 }
 
 void motion_restart(MotionFusion *m) {
-    AcquireSRWLockExclusive(&m->lock);
+    plat_mutex_lock(&m->lock);
     m->restart = 1;
     m->first = m->produced;
     m->last_ns = 0;   // the first sample after the restart integrates nothing across the stop
     memset(m->angle, 0, sizeof m->angle);
-    ReleaseSRWLockExclusive(&m->lock);
+    plat_mutex_unlock(&m->lock);
 }

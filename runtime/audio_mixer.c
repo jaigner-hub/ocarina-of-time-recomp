@@ -665,8 +665,8 @@ static void mix_aux(AudioRenderer *r, int mix, const AudrenEffectIn *e) {
     uint32_t wr=sh[1],read=rh[0],total=p.channels*(uint32_t)m->frame;
     if(e->enabled) { m->aux_calls++; if(((const uint32_t *)send)[0]!=wr) m->aux_late++; }
     if(rt_trace & RT_TRACE_AUDIO) {   // the rings' cursors: CPU header (read, write, lost, total) and DSP header, send then return
-        static volatile LONG calls;
-        LONG n=InterlockedIncrement(&calls);
+        static volatile int32_t calls;
+        int32_t n=__atomic_add_fetch(&calls, 1, __ATOMIC_SEQ_CST);
         if(n<=40 || n%1000==0) {
             const uint32_t *sc=(const uint32_t *)send,*rc=(const uint32_t *)ret;
             rt_log("audio: aux call %ld: %u ch x %d, capacity %u; send cpu %u/%u/%u/%u dsp %u/%u/%u/%u; return cpu %u/%u/%u/%u dsp %u/%u/%u/%u; return sample %d",

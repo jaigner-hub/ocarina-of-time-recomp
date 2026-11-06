@@ -8,24 +8,31 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#ifdef _WIN32
+#define strncasecmp _strnicmp
+#else
+#include <strings.h>
+#endif
 
 #include "cfg.h"
 #include "host.h"
 #include "vk.h"
+#include "platform/platform.h"
+
+#define MAX_PATH 260   // the buffers keep the Windows sizes (MAX_PATH * 2) on both systems
 
 static VkCtx g_vk;
 static int g_ready;
-static SRWLOCK g_lock = SRWLOCK_INIT;
+static PlatMutex g_lock = PLAT_MUTEX_INIT;
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
     (void)type, (void)user;
     int err = (sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) != 0;
-    if (err) InterlockedIncrement(&g_vk.validation_errors);
+    if (err) __atomic_add_fetch(&g_vk.validation_errors, 1, __ATOMIC_SEQ_CST);
     static volatile long logged;
     char who[96];
-    if (InterlockedIncrement(&logged) <= 500)
+    if (__atomic_add_fetch(&logged, 1, __ATOMIC_SEQ_CST) <= 500)
         rt_log("vk validation %s (%s): %s", err ? "error" : "warning", kern_thread_describe(who, sizeof who), d->pMessage);
     return VK_FALSE;
 }
@@ -47,8 +54,13 @@ static int layer_present(const char *name) {
 }
 
 static int create_instance(void) {
-    const char *ext[5] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
-    uint32_t n_ext = 2;
+    const char *ext[8] = {VK_KHR_SURFACE_EXTENSION_NAME};
+    uint32_t n_ext = 1;
+#ifdef _WIN32
+    ext[n_ext++] = VK_KHR_WIN32_SURFACE_EXTENSION_NAME;
+#else
+    n_ext += gfx_window_vk_extensions(ext + n_ext, (int)(8 - n_ext - 2));   // the window system's surface extensions (SDL)
+#endif
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     // OOT_VK_VALIDATION=1: the Khronos layer; =gpu: with GPU-assisted validation too, which instruments every shader's
     // buffer and image accesses and names an out-of-bounds store (slow; for a device loss the breadcrumbs cannot place).
@@ -106,18 +118,22 @@ static const char *missing_required(VkPhysicalDevice pd) {
     return miss;
 }
 
-// Graphics+compute family that can present on win32.
+// Graphics+compute family that can present on the window (win32, or the SDL surface).
 static uint32_t find_gfx_family(VkPhysicalDevice pd, const VkQueueFamilyProperties *qp, uint32_t nq) {
     for (uint32_t i = 0; i < nq; i++)
         if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+#ifdef _WIN32
             vkGetPhysicalDeviceWin32PresentationSupportKHR(pd, i))
+#else
+            gfx_window_vk_presentable(g_vk.instance, pd, i))
+#endif
             return i;
     return UINT32_MAX;
 }
 
 static int name_has(const char *s, const char *sub) {
     for (size_t n = strlen(sub); *s; s++)
-        if (!_strnicmp(s, sub, n)) return 1;
+        if (!strncasecmp(s, sub, n)) return 1;
     return 0;
 }
 
@@ -371,21 +387,21 @@ static void destroy_all(void) {
 long vk_validation_errors_total(void) { return g_errors_total + (g_ready ? g_vk.validation_errors : 0); }
 
 int vk_init(void) {
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_lock(&g_lock);
     if (!g_ready) {
         memset(&g_vk, 0, sizeof g_vk);
         if (create_instance() && pick_device() && create_device()) g_ready = 1, vk_headroom_start();
         else destroy_all();
     }
     int ok = g_ready;
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
     return ok;
 }
 
 void vk_shutdown(void) {
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_lock(&g_lock);
     if (g_ready) { destroy_all(); g_ready = 0; }
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
 }
 
 VkCtx *vk_ctx(void) { return g_ready ? &g_vk : NULL; }
@@ -406,11 +422,11 @@ static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
 // The query runs once per process. Threads that hit the loss at the same time wait on the lock until it is logged, so
 // none of them reaches its rt_fatal and ends the process before the report is written.
 void vk_device_fault_report(VkResult r) {
-    static SRWLOCK lock = SRWLOCK_INIT;
+    static PlatMutex lock = PLAT_MUTEX_INIT;
     static int done;
     if (r != VK_ERROR_DEVICE_LOST) return;
-    AcquireSRWLockExclusive(&lock);
-    if (done) { ReleaseSRWLockExclusive(&lock); return; }
+    plat_mutex_lock(&lock);
+    if (done) { plat_mutex_unlock(&lock); return; }
     done = 1;
     vk_crumbs_report();
     vk_exec_fault_ops();
@@ -421,7 +437,7 @@ void vk_device_fault_report(VkResult r) {
     if (!get) {
         rt_log("vk: device lost; no fault report (VK_EXT_device_fault %s)", c && c->has_device_fault ? "has no entry point"
                                                                                                     : "not enabled");
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         return;
     }
     VkDeviceFaultCountsEXT n = {.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
@@ -437,7 +453,8 @@ void vk_device_fault_report(VkResult r) {
     if (blob && (q == VK_SUCCESS || q == VK_INCOMPLETE)) {
         char path[MAX_PATH * 3];
         snprintf(path, sizeof path, "%s", rt_log_path() ? rt_log_path() : "fault.log");
-        char *cut = strrchr(path, '\\');
+        char *cut = strrchr(path, '/'), *bs = strrchr(path, '\\');   // either separator
+        if (bs && (!cut || bs > cut)) cut = bs;
         snprintf(cut ? cut + 1 : path, sizeof path - (size_t)(cut ? cut + 1 - path : 0), "fault-vendor.bin");
         FILE *f = fopen(path, "wb");
         if (f) { fwrite(blob, 1, (size_t)n.vendorBinarySize, f); fclose(f); rt_log("vk: device fault vendor binary written to %s", path); }
@@ -458,7 +475,7 @@ void vk_device_fault_report(VkResult r) {
     }
     free(ai);
     free(vi);
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 int vk_selftest(void) {

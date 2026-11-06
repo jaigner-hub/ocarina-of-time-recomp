@@ -5,15 +5,16 @@
 // contributors; itself from d2r-mobile dm/host/hle_thread.c), d2r-mobile dm/host/thread.c @ 53e7c5b (MIT, Copyright
 // (c) 2026 jhaizhou) and LAS Recomp runtime/kernel.c @ da35b83 (MIT, Copyright (c) 2026 Peiikai); the preemption of
 // virtual cores from MacNativeGames threads.c @ 33e8fa8 (MIT, as above).
+// Made portable (platform.h's threads, locks, thread interruption, fibers, jumps and timed waits in place of the
+// Windows API) as totk-pc-recomp runtime/kernel.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026
+// Valiantsin Dzerakh) does: the same calls for the same jobs, and the System V version of kern_ap_stub from there. The
+// Windows code that was here is in runtime/platform/win32.c.
 // Threads, synchronization, virtual cores and fibers of the Horizon kernel.
 //
-// One guest thread = one Windows thread with a 256 MiB reserved host stack (every guest BL is a host call) and its own
+// One guest thread = one host thread with a 256 MiB reserved host stack (every guest BL is a host call) and its own
 // Cpu. The SDK's nn::os runs as lifted code; only the kernel under it is the host. Every wait hangs on one global lock
 // G with one condition variable per thread; wake order is the kernel's: lower priority value first, then first come.
 // Semantics follow the public Horizon kernel (KConditionVariable, KAddressArbiter, KSynchronization).
-#include <windows.h>
-#define __USE_MINGW_SETJMP_NON_SEH   // setjmp(b) = _setjmp(b, NULL): longjmp restores registers, no SEH unwinding
-#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +67,7 @@ struct RtThread {
     int prio, core;
     uint64_t mask;
     int started, exited, closed, cancel, is_main;
-    CONDITION_VARIABLE cv;
+    PlatCond cv;
     // current wait
     int wkind, woke;
     uint64_t waddr, wkey;
@@ -79,15 +80,14 @@ struct RtThread {
     uint64_t cseq;
     RtThread *cnext;
     uint8_t *tlr, *tls;
-    jmp_buf exit_jmp;          // the thread start; ExitThread longjmps to it
+    PlatJmp exit_jmp;          // the thread start; ExitThread jumps back to it (plat_jmp_go)
     // fibers
-    void *base_fiber;          // the host thread as a host fiber, after the first switch
+    PlatFiber *base_fiber;     // the host thread as a host fiber, after the first switch
     Fiber *fiber;              // current guest fiber, NULL on the thread's own context
     Fiber *leaving;            // fiber just switched away from, released by whoever resumes next
     int exit_pending;          // ExitThread on a fiber: unwind once back on the thread's own context
-    HANDLE timer;              // high-resolution waitable timer for SleepThread
     // OOT_TRACE=sched accounting (holding G)
-    DWORD tid;                 // host thread id
+    uint32_t tid;              // host thread id (plat_thread_id)
     int st;                    // S_* state since st_since
     uint64_t st_since, st_ns[S_N], nblk, npre, pre_since, cpu_last;
     uint64_t wobj;             // what the current wait is on: owner handle, key, address or first handle
@@ -97,7 +97,7 @@ struct RtThread {
     uint64_t sp_n, sp_ho, sp_site;   // spin wait passes and core handoffs, the last loop head (the thread writes them)
     RtThread *target;          // as a core waiter: the owner core_kick asked to give its core up for it (holding G)
     // OOT_ASYNC_PREEMPT (holding G)
-    HANDLE hthr;               // the host thread, for SuspendThread / Get/SetThreadContext; open while it may own a core
+    PlatIntr *hthr;            // the host thread, for plat_intr_stop / resume; open while it may own a core
     uint64_t ap_rip;           // the interrupted host rip kern_ap_stub returns to
     uint64_t ap_last;          // the last redirect attempt on this owner
     int ap_pending;            // redirected to kern_ap_stub, which has not reached kern_ap_yield yet
@@ -113,7 +113,7 @@ struct RtThread {
                                                                                                  // owner that released
 };
 
-static SRWLOCK G = SRWLOCK_INIT;
+static PlatMutex G = PLAT_MUTEX_INIT;
 static struct { int type; void *obj; } g_h[MAX_H];
 static _Thread_local RtThread *tcur;
 _Static_assert(offsetof(RtThread, preempt) == 0, "host.h kern_preempt_pending reads the first int");
@@ -122,8 +122,8 @@ static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
 static uint64_t g_main_stack;
 
-static void lock(void) { AcquireSRWLockExclusive(&G); }
-static void unlock(void) { ReleaseSRWLockExclusive(&G); }
+static void lock(void) { plat_mutex_lock(&G); }
+static void unlock(void) { plat_mutex_unlock(&G); }
 
 uint64_t kern_now_ns(void) { return plat_now_ns(); }
 
@@ -242,7 +242,7 @@ static void wake(RtThread *t, uint32_t res) {
     t->waker = tcur ? tcur->handle : 0;
     if (rt_trace & RT_TRACE_SCHED) t->wake_at = kern_now_ns();
     if (g_crit_on) crit_add(CRIT_WAKE, t->handle, t->waker, 0, 0, t->wake_at);
-    WakeConditionVariable(&t->cv);
+    plat_cond_signal(&t->cv);
 }
 
 static void wake_sync_waiters(void) {
@@ -253,8 +253,8 @@ static void wake_sync_waiters(void) {
     }
 }
 
-// SleepConditionVariableSRW counts milliseconds: round up (late is legal, early is not) and re-check the deadline
-// against the performance counter, because the wait may also end early.
+// The timed wait counts milliseconds: round up (late is legal, early is not) and re-check the deadline against the
+// performance counter, because the wait may also end early.
 static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     t->wkind = kind;
     t->woke = 0;
@@ -271,7 +271,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
     uint64_t deadline = forever ? 0 : now + (uint64_t)ns;
     while (!t->woke) {
         if (forever) {
-            SleepConditionVariableSRW(&t->cv, &G, INFINITE, 0);
+            plat_cond_wait(&t->cv, &G);
             continue;
         }
         now = kern_now_ns();
@@ -281,7 +281,7 @@ static uint32_t block_inner(RtThread *t, int kind, int64_t ns) {
             return R_TIMEOUT;
         }
         uint64_t ms = (deadline - now + 999999) / 1000000;
-        SleepConditionVariableSRW(&t->cv, &G, ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (DWORD)ms, 0);
+        plat_cond_wait_ms(&t->cv, &G, ms > 0xFFFFFFF0u ? 0xFFFFFFF0u : (uint32_t)ms);
     }
     if (t->wake_at) {
         uint64_t d = kern_now_ns() - t->wake_at;
@@ -378,8 +378,8 @@ static void ap_init(void) {
     }
     rt_log("kernel: asynchronous preemption of virtual cores %s, priority inheritance and preemption disable %s; lifted "
            "code exe+%#llx-exe+%#llx", g_ap_int ? "on" : "off", g_ap ? "on (OOT_ASYNC_PREEMPT=0 turns all off)" : "off",
-           (unsigned long long)(g_gen_lo ? g_gen_lo - (uintptr_t)GetModuleHandleW(NULL) : 0),
-           (unsigned long long)(g_gen_hi ? g_gen_hi - (uintptr_t)GetModuleHandleW(NULL) : 0));
+           (unsigned long long)(g_gen_lo ? g_gen_lo - plat_exe_base() : 0),
+           (unsigned long long)(g_gen_hi ? g_gen_hi - plat_exe_base() : 0));
 }
 
 // Horizon's priority inheritance: o counts at the priority of the best thread blocked on a guest mutex it owns (the
@@ -406,6 +406,7 @@ static int ap_disabled(const RtThread *t) { return g_ap > 0 && ap_tlr(t)[0]; }
 // in kern_ap_yield and jumps back to kern_ap_rip(), whose value it first stores in the return slot it reserved at
 // entry, so a stack walk sees the interrupted function as its caller. No ret: the jump keeps call/return pairs
 // balanced. The waiter never writes the owner's stack.
+#ifdef _WIN32
 __asm__(".text\n"
         ".globl kern_ap_stub\n"
         ".def kern_ap_stub; .scl 2; .type 32; .endef\n"
@@ -491,11 +492,94 @@ __asm__(".text\n"
         "    leaq 8(%rsp), %rsp\n"
         "    jmpq *-8(%rsp)\n"
         ".seh_endproc\n");
+#else
+// The System V version: rsi and rdi are volatile there too, and the interrupted code may keep data in the 128 bytes
+// below its stack pointer (the red zone), so the return slot and the saves go below that. Without a red zone in the
+// way the slot is at entry - 136; the exit restores rsp to the entry value and jumps through the slot.
+__asm__(".text\n"
+        ".globl kern_ap_stub\n"
+        ".type kern_ap_stub, @function\n"
+        ".p2align 4\n"
+        "kern_ap_stub:\n"
+        "    .cfi_startproc\n"
+        "    leaq -136(%rsp), %rsp\n"   // not sub: the flags are still the interrupted code's until pushfq
+        "    pushfq\n"
+        "    pushq %rax\n"
+        "    pushq %rcx\n"
+        "    pushq %rdx\n"
+        "    pushq %rsi\n"
+        "    pushq %rdi\n"
+        "    pushq %r8\n"
+        "    pushq %r9\n"
+        "    pushq %r10\n"
+        "    pushq %r11\n"
+        "    pushq %rbp\n"
+        "    movq %rsp, %rbp\n"
+        "    andq $-32, %rsp\n"
+        "    subq $576, %rsp\n"   // 32: MXCSR saved, 36: MXCSR default, 64: YMM0-15 (XMM0-15 without AVX)
+        "    vmovdqa %ymm0, 64(%rsp)\n"
+        "    vmovdqa %ymm1, 96(%rsp)\n"
+        "    vmovdqa %ymm2, 128(%rsp)\n"
+        "    vmovdqa %ymm3, 160(%rsp)\n"
+        "    vmovdqa %ymm4, 192(%rsp)\n"
+        "    vmovdqa %ymm5, 224(%rsp)\n"
+        "    vmovdqa %ymm6, 256(%rsp)\n"
+        "    vmovdqa %ymm7, 288(%rsp)\n"
+        "    vmovdqa %ymm8, 320(%rsp)\n"
+        "    vmovdqa %ymm9, 352(%rsp)\n"
+        "    vmovdqa %ymm10, 384(%rsp)\n"
+        "    vmovdqa %ymm11, 416(%rsp)\n"
+        "    vmovdqa %ymm12, 448(%rsp)\n"
+        "    vmovdqa %ymm13, 480(%rsp)\n"
+        "    vmovdqa %ymm14, 512(%rsp)\n"
+        "    vmovdqa %ymm15, 544(%rsp)\n"
+        "    stmxcsr 32(%rsp)\n"
+        "    movl $0x1f80, 36(%rsp)\n"
+        "    ldmxcsr 36(%rsp)\n"
+        "    cld\n"
+        "    vzeroupper\n"
+        "    call kern_ap_rip\n"
+        "    movq %rax, 88(%rbp)\n"   // the return slot: rbp + 10 pushes + pushfq
+        "    call kern_ap_yield\n"
+        "    ldmxcsr 32(%rsp)\n"
+        "    vmovdqa 64(%rsp), %ymm0\n"
+        "    vmovdqa 96(%rsp), %ymm1\n"
+        "    vmovdqa 128(%rsp), %ymm2\n"
+        "    vmovdqa 160(%rsp), %ymm3\n"
+        "    vmovdqa 192(%rsp), %ymm4\n"
+        "    vmovdqa 224(%rsp), %ymm5\n"
+        "    vmovdqa 256(%rsp), %ymm6\n"
+        "    vmovdqa 288(%rsp), %ymm7\n"
+        "    vmovdqa 320(%rsp), %ymm8\n"
+        "    vmovdqa 352(%rsp), %ymm9\n"
+        "    vmovdqa 384(%rsp), %ymm10\n"
+        "    vmovdqa 416(%rsp), %ymm11\n"
+        "    vmovdqa 448(%rsp), %ymm12\n"
+        "    vmovdqa 480(%rsp), %ymm13\n"
+        "    vmovdqa 512(%rsp), %ymm14\n"
+        "    vmovdqa 544(%rsp), %ymm15\n"
+        "    movq %rbp, %rsp\n"
+        "    popq %rbp\n"
+        "    popq %r11\n"
+        "    popq %r10\n"
+        "    popq %r9\n"
+        "    popq %r8\n"
+        "    popq %rdi\n"
+        "    popq %rsi\n"
+        "    popq %rdx\n"
+        "    popq %rcx\n"
+        "    popq %rax\n"
+        "    popfq\n"
+        "    leaq 136(%rsp), %rsp\n"
+        "    jmpq *-136(%rsp)\n"
+        "    .cfi_endproc\n"
+        ".size kern_ap_stub, .-kern_ap_stub\n");
+#endif
 
 enum { AP_NONE, AP_RETRY, AP_SENT };
 
-// The waiter w interrupts its target owner if that runs top-level game code (holding G; the owner is suspended only
-// between SuspendThread and ResumeThread, during which nothing here takes a lock).
+// The waiter w interrupts its target owner if that runs top-level game code (holding G; the owner is stopped only
+// between plat_intr_stop and plat_intr_resume, during which nothing here takes a lock).
 static int ap_try(RtThread *w) {
     RtThread *o = w->target;
     if (!o || o->cur_core < 0 || !o->preempt) return AP_NONE;
@@ -513,17 +597,14 @@ static int ap_try(RtThread *w) {
     uint64_t now = kern_now_ns();
     if (o->ap_last && now - o->ap_last < AP_GAP_NS) return AP_RETRY;
     o->ap_last = now;
-    if (SuspendThread(o->hthr) == (DWORD)-1) {
+    uint64_t rip, rsp;
+    if (!plat_intr_stop(o->hthr, &rip, &rsp)) {
         g_ap_fail++;
         return AP_RETRY;
     }
-    CONTEXT ctx;
-    memset(&ctx, 0, sizeof ctx);
-    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;   // set back whole, so the kernel restores every GPR
     int r = AP_RETRY;
-    if (!GetThreadContext(o->hthr, &ctx))
-        g_ap_fail++;
-    else if (ctx.Rip < g_gen_lo || ctx.Rip > g_gen_hi)
+    uint64_t to = 0;
+    if (rip < g_gen_lo || rip > g_gen_hi)
         g_ap_pc++;
     else if (__atomic_load_n(&o->host_depth, __ATOMIC_RELAXED) > 0)
         g_ap_host++;
@@ -531,23 +612,21 @@ static int ap_try(RtThread *w) {
         tl[1] = 1;
         g_ap_deferred++;
     } else {
-        o->ap_rip = ctx.Rip;
+        o->ap_rip = rip;
         o->ap_pending = 1;
-        ctx.Rip = (DWORD64)(uintptr_t)kern_ap_stub;
-        if (SetThreadContext(o->hthr, &ctx)) {
-            g_ap_sent++;
-            r = AP_SENT;
-        } else {
-            o->ap_pending = 0;
-            g_ap_fail++;
-        }
+        to = (uint64_t)(uintptr_t)kern_ap_stub;
     }
-    ResumeThread(o->hthr);
+    if (!plat_intr_resume(o->hthr, to)) {
+        o->ap_pending = 0;
+        g_ap_fail++;
+    } else if (to) {
+        g_ap_sent++;
+        r = AP_SENT;
+    }
     if (r == AP_SENT && g_ap_log < AP_LOG_N) {
         g_ap_log++;
         rt_log("kernel: interrupt %#x p%d at exe+%#llx rsp %#llx for %#x p%d", o->handle, o->prio,
-               (unsigned long long)(o->ap_rip - (uintptr_t)GetModuleHandleW(NULL)), (unsigned long long)ctx.Rsp,
-               w->handle, w->prio);
+               (unsigned long long)(o->ap_rip - plat_exe_base()), (unsigned long long)rsp, w->handle, w->prio);
     }
     return r;
 }
@@ -668,30 +747,18 @@ static void dg_done(RtThread *t) {
 // its guest lr. Holding G; the owner is resumed before anything that could take a lock it holds.
 static void dg_sample(RtThread *t) {
     RtThread *o = t->target;
-    if (!o || o->cur_core < 0 || !o->tid || g_dg_samples >= DG_SAMPLES) return;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, o->tid);
-    if (!h) return;
-    CONTEXT ctx;
-    memset(&ctx, 0, sizeof ctx);
-    ctx.ContextFlags = CONTEXT_CONTROL;
-    int depth = 0, ok = 0;
-    if (SuspendThread(h) != (DWORD)-1) {
-        ok = GetThreadContext(h, &ctx);
-        depth = __atomic_load_n(&o->host_depth, __ATOMIC_RELAXED);
-        ResumeThread(h);
-    }
-    CloseHandle(h);
-    if (!ok) return;
+    if (!o || o->cur_core < 0 || !o->hthr || g_dg_samples >= DG_SAMPLES) return;
+    uint64_t rip, rsp;
+    if (!plat_intr_stop(o->hthr, &rip, &rsp)) return;
+    int depth = __atomic_load_n(&o->host_depth, __ATOMIC_RELAXED);
+    plat_intr_resume(o->hthr, 0);
     g_dg_samples++;
-    HMODULE m = NULL;
-    wchar_t mw[MAX_PATH] = L"?";
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)(uintptr_t)ctx.Rip, &m) && m)
-        GetModuleFileNameW(m, mw, MAX_PATH);
-    const wchar_t *mn = wcsrchr(mw, L'\\') ? wcsrchr(mw, L'\\') + 1 : mw;
+    char mn[256] = "?";
+    uintptr_t m = 0;
+    plat_module_of((uintptr_t)rip, mn, sizeof mn, &m);
     char lr[128];
-    rt_log("core-diag: sample owner %#x p%d depth %d rip %ls+%#llx, last svc %#x, guest lr %s (waiter %#x p%d, %s, "
-           "%.2f ms)", o->handle, o->prio, depth, mn, (unsigned long long)(ctx.Rip - (uintptr_t)m), o->dg_svc,
+    rt_log("core-diag: sample owner %#x p%d depth %d rip %s+%#llx, last svc %#x, guest lr %s (waiter %#x p%d, %s, "
+           "%.2f ms)", o->handle, o->prio, depth, mn, (unsigned long long)(rip - m), o->dg_svc,
            o->cur ? ldr_describe(o->cur->x[30], lr, sizeof lr) : "-", t->handle, t->prio,
            t->dg_cls == DG_HOST ? "host" : "game", (kern_now_ns() - t->dg_since) / 1e6);
 }
@@ -700,13 +767,13 @@ static void dg_sample(RtThread *t) {
 // ---- OOT_THREAD_DUMP=<frame>[,<frame>...]: at those presents, every guest thread with its priority, its core, what it
 // waits on and a frame-pointer backtrace of its guest context, to find what a game that stopped making progress waits
 // for. The backtrace reads the thread's Cpu while it is blocked in the host, where lifted code has stored its x29/x30.
-static struct { DWORD tid; const char *name; } g_host_threads[8];
+static struct { uint32_t tid; const char *name; } g_host_threads[8];
 static int g_nhost;
 
 // The calling thread for a log line: a guest thread's handle and priority, a noted host thread's name, or its id.
 const char *kern_thread_describe(char *o, size_t n) {
     RtThread *t = tcur;
-    DWORD tid = GetCurrentThreadId();
+    uint32_t tid = plat_thread_id();
     if (t) snprintf(o, n, "guest thread %#x prio %d%s (host %lu)", t->handle, t->prio, t->is_main ? " main" : "", (unsigned long)tid);
     else {
         const char *name = NULL;
@@ -720,60 +787,35 @@ const char *kern_thread_describe(char *o, size_t n) {
 void kern_host_thread_note(const char *name) {
     lock();
     if (g_nhost < 8) {
-        g_host_threads[g_nhost].tid = GetCurrentThreadId();
+        g_host_threads[g_nhost].tid = plat_thread_id();
         g_host_threads[g_nhost++].name = name;
     }
     unlock();
 }
 
-// The host stack of another thread: suspended, its context read and unwound with ntdll's unwinder (no dbghelp, so no
-// loader lock while it is suspended; a leaf frame without unwind data pops its return address). The thread is resumed
-// before anything that logs or takes a lock, as it may hold one. Up to max return addresses, the newest first.
-static int host_stack(DWORD tid, uint64_t *frames, int max) {
-    if (!tid || tid == GetCurrentThreadId()) return 0;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!h) return 0;
-    int n = 0;
-    if (SuspendThread(h) != (DWORD)-1) {
-        CONTEXT ctx;
-        memset(&ctx, 0, sizeof ctx);
-        ctx.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(h, &ctx)) {
-            for (; n < max && ctx.Rip; ) {
-                frames[n++] = ctx.Rip;
-                DWORD64 base = 0;
-                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
-                if (!fn) {
-                    if (IsBadReadPtr((const void *)(uintptr_t)ctx.Rsp, 8)) break;
-                    ctx.Rip = *(const DWORD64 *)(uintptr_t)ctx.Rsp;
-                    ctx.Rsp += 8;
-                } else {
-                    PVOID handler = NULL;
-                    DWORD64 est = 0;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &handler, &est, NULL);
-                }
-            }
-        }
-        ResumeThread(h);
-    }
-    CloseHandle(h);
-    return n;
-}
-
-static void host_stack_log(DWORD tid) {
+// The host stack of another thread (plat_stack_walk), else where it runs: the interrupted instruction pointer of a thread
+// that has a handle for plat_intr_stop (OOT_ASYNC_PREEMPT or OOT_CORE_DIAG on). A thread is resumed before anything that
+// logs, as it may hold a lock. Holding G.
+static void host_stack_log(uint32_t tid) {
+    if (!tid || tid == plat_thread_id()) return;   // stopping the calling thread would wait for itself
     uint64_t frames[14];
-    int n = host_stack(tid, frames, 14);
-    if (!n) return;
+    int n = plat_stack_walk(tid, frames, 14);
+    if (!n) {
+        RtThread *o = NULL;
+        for (RtThread *t = g_all; t; t = t->all)
+            if (t->tid == tid) o = t;
+        uint64_t rsp;
+        if (!o || !o->hthr || !plat_intr_stop(o->hthr, &frames[0], &rsp)) return;
+        plat_intr_resume(o->hthr, 0);
+        n = 1;
+    }
     char line[1024];
     int at = snprintf(line, sizeof line, "  host:");
     for (int i = 0; i < n && at < (int)sizeof line - 80; i++) {
-        HMODULE m = NULL;
-        wchar_t mw[MAX_PATH] = L"?";
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCWSTR)(uintptr_t)frames[i], &m) && m)
-            GetModuleFileNameW(m, mw, MAX_PATH);
-        const wchar_t *mn = wcsrchr(mw, L'\\') ? wcsrchr(mw, L'\\') + 1 : mw;
-        at += snprintf(line + at, sizeof line - (size_t)at, " %ls+%#llx", mn, (unsigned long long)(frames[i] - (uintptr_t)m));
+        char mn[256] = "?";
+        uintptr_t m = 0;
+        plat_module_of((uintptr_t)frames[i], mn, sizeof mn, &m);
+        at += snprintf(line + at, sizeof line - (size_t)at, " %s+%#llx", mn, (unsigned long long)(frames[i] - m));
     }
     rt_logf("%s\n", line);
 }
@@ -815,7 +857,7 @@ static void thread_dump(uint64_t frame) {
             rt_logf("  pc %s\n", h ? h : ldr_describe(t->cur->pc, d, sizeof d));
             kern_backtrace(t->cur);
         }
-        host_stack_log((DWORD)t->tid);
+        host_stack_log(t->tid);
     }
     for (int i = 0; i < g_nhost; i++) {
         rt_logf("host thread %s (host %lu)\n", g_host_threads[i].name, (unsigned long)g_host_threads[i].tid);
@@ -827,11 +869,11 @@ static void thread_dump(uint64_t frame) {
 // An entry written s<seconds> fires at that wall-clock time since the first present instead, from a host thread: for
 // a game that stopped presenting, where a frame number never comes. The dump reads the thread list under the kernel
 // lock, so the thread it runs on does not matter.
-static DWORD WINAPI thread_dump_timer(LPVOID arg) {
+static void thread_dump_timer(void *arg) {
     uint64_t *secs = arg;
     uint64_t done = 0;
     for (;;) {
-        Sleep(1000);
+        plat_sleep_ns(1000000000ull);
         done++;
         for (int i = 0; i < 16 && secs[i]; i++)
             if (secs[i] == done) thread_dump(done * 1000000000ull);   // the "frame" printed: nanoseconds, told apart by size
@@ -855,8 +897,7 @@ static void thread_dump_frame(uint64_t frame) {
             p = *end == ',' ? end + 1 : end;
         }
         if (ns) {
-            HANDLE h = CreateThread(NULL, 0, thread_dump_timer, secs, 0, NULL);
-            if (h) CloseHandle(h);
+            plat_thread_spawn(thread_dump_timer, secs, "thread dump", 0);
         }
     }
     for (int i = 0; i < n; i++)
@@ -958,7 +999,7 @@ static void core_grant(int c) {
     core_count();
     if (g_diag > 0) b->dg_rel = g_dg_rel;
     if (rt_trace & RT_TRACE_SCHED) b->grant_at = kern_now_ns();
-    WakeConditionVariable(&b->cv);
+    plat_cond_signal(&b->cv);
 }
 
 static void core_put(RtThread *t) {
@@ -1097,17 +1138,18 @@ static void core_take(RtThread *t) {
     if (g_ap_int && t->target && t->cur_core < 0) {   // most waits end within microseconds: spin before interrupting
         uint64_t end = kern_now_ns() + AP_FIRST_NS;
         unlock();
-        while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) YieldProcessor();
+        while (__atomic_load_n(&t->cur_core, __ATOMIC_RELAXED) < 0 && kern_now_ns() < end) plat_pause();
         lock();
         if (t->cur_core >= 0) g_ap_spin_ok++;
     }
     int sampled = 0;
     while (t->cur_core < 0) {
-        DWORD ms = INFINITE;
+        uint32_t ms = 0;   // 0: until signalled
         if (g_ap_int && ap_try(t) != AP_NONE) ms = 1;   // the owner keeps its core: again in a millisecond
         int sample = g_diag > 0 && !sampled && (t->dg_cls == DG_GAME || t->dg_cls == DG_HOST);
-        if (sample && ms == INFINITE) ms = 2;
-        SleepConditionVariableSRW(&t->cv, &G, ms, 0);
+        if (sample && !ms) ms = 2;
+        if (ms) plat_cond_wait_ms(&t->cv, &G, ms);
+        else plat_cond_wait(&t->cv, &G);
         if (sample && t->cur_core < 0 && kern_now_ns() - t->dg_since >= 2000000) {
             sampled = 1;
             dg_sample(t);
@@ -1143,7 +1185,7 @@ int kern_core_away(void) {
     core_put(t);
     acct(t, S_HOST);
     if (rt_trace & RT_TRACE_SCHED)   // the caller as an exe RVA (oot.map)
-        t->wobj = (uintptr_t)__builtin_return_address(0) - (uintptr_t)GetModuleHandleW(NULL);
+        t->wobj = (uintptr_t)__builtin_return_address(0) - plat_exe_base();
     unlock();
     return 1;
 }
@@ -1175,7 +1217,7 @@ static _Thread_local uint64_t sw_head, sw_t0, sw_last;
 
 void rt_spin_gate(Cpu *c, uint64_t head) {
     (void)c;
-    YieldProcessor();
+    plat_pause();
     RtThread *t = tcur;
     if (!t) return;
     if (g_spin_on < 0) {
@@ -1196,7 +1238,7 @@ void rt_spin_gate(Cpu *c, uint64_t head) {
         return;
     t->sp_ho++;
     int away = kern_core_away();
-    SwitchToThread();
+    plat_yield();
     kern_core_back(&away);
     sw_last = kern_now_ns();
 }
@@ -1395,15 +1437,11 @@ void kern_sched_report(uint64_t frame) {
         r->sl_n = t->sl_n, r->sl_req = t->sl_req, r->sl_act = t->sl_act;
         r->sp_n = t->sp_n, r->sp_ho = t->sp_ho, r->sp_site = t->sp_site;
         r->cpu = 0;
-        HANDLE th = t->tid ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, t->tid) : NULL;
-        FILETIME a, b, k, u;
-        if (th && GetThreadTimes(th, &a, &b, &k, &u)) {
-            uint64_t c = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) +
-                          ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime)) * 100;
+        uint64_t c = t->tid ? plat_thread_cpu_ns(t->tid) : 0;
+        if (c) {
             r->cpu = t->cpu_last ? c - t->cpu_last : 0;
             t->cpu_last = c;
         }
-        if (th) CloseHandle(th);
     }
     for (int k = 0; k < 2; k++) {
         const WaitRec *src = k ? g_mw : g_rw;
@@ -1512,10 +1550,10 @@ static void lock_acquire_for(RtThread *t, uint64_t addr, uint32_t tag) {
 // ---- threads
 static RtThread *thr_new(int prio, int core, uint64_t mask) {
     RtThread *t = calloc(1, sizeof *t);
-    Cpu *c = _aligned_malloc(sizeof(Cpu), 64);
+    Cpu *c = plat_aligned_alloc(sizeof(Cpu), 64);
     if (!t || !c) rt_fatal("kernel: thread allocation");
     memset(c, 0, sizeof *c);
-    InitializeConditionVariable(&t->cv);
+    plat_cond_init(&t->cv);
     t->prio = prio;
     t->core = core;
     t->mask = mask;
@@ -1553,22 +1591,20 @@ static void thr_free(RtThread *t) {   // holding G; t has exited and its handle 
         }
     mem_kernel_free(t->tlr, TLR_SIZE + THREAD_OBJ_SIZE);
     mem_kernel_free(t->tls, TLS_SIZE);
-    _aligned_free(t->cpu);
+    plat_aligned_free(t->cpu);
     free(t);
 }
 
 // The end of every guest thread, on its own host context after the unwind: give the core up, signal the thread
 // object, free it if its handle is already closed. t is not touched after the unlock.
 static void thread_finish(RtThread *t) {
-    if (t->timer) CloseHandle(t->timer);
-    t->timer = NULL;
-    if (t->base_fiber) ConvertFiberToThread();
+    if (t->base_fiber) plat_fiber_unself();
     t->base_fiber = NULL;
     tcur = NULL;
     lock();
     core_put(t);
     acct(t, S_OFF);
-    if (t->hthr) CloseHandle(t->hthr);   // no waiter interrupts a thread without a core
+    if (t->hthr) plat_intr_free(t->hthr);   // no waiter interrupts a thread without a core
     t->hthr = NULL;
     t->exited = 1;
     wake_sync_waiters();
@@ -1576,40 +1612,39 @@ static void thread_finish(RtThread *t) {
     unlock();
 }
 
-// ExitThread: back to the thread start with a non-unwinding longjmp; no SEH unwinding through lifted frames.
-// (__builtin_setjmp is not usable: on Win64 LLVM saves the frame address, which is not rbp when the frame register
-// is offset, and the landing code then reads its locals through the wrong base.)
-static __attribute__((noreturn)) void exit_now(RtThread *t) { longjmp(t->exit_jmp, 1); }
+// ExitThread: back to the thread start with plat_jmp_go, which unwinds nothing: no SEH unwinding through lifted
+// frames. (__builtin_setjmp is not usable: on Win64 LLVM saves the frame address, which is not rbp when the frame
+// register is offset, and the landing code then reads its locals through the wrong base.)
+static __attribute__((noreturn)) void exit_now(RtThread *t) { plat_jmp_go(&t->exit_jmp); }
 
-// The calling host thread, for ap_try (OOT_ASYNC_PREEMPT only).
-static HANDLE ap_open_self(void) {
-    if (!cores_enabled() || !g_ap_int) return NULL;
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
-                          FALSE, GetCurrentThreadId());
-    if (!h) rt_log("kernel: OpenThread for asynchronous preemption failed (error %lu)", GetLastError());
+// The calling host thread, for ap_try (OOT_ASYNC_PREEMPT) and dg_sample (OOT_CORE_DIAG).
+static PlatIntr *ap_open_self(void) {
+    if (!cores_enabled() || (!g_ap_int && g_diag <= 0)) return NULL;
+    PlatIntr *h = plat_intr_self();
+    if (!h) rt_log("kernel: no interruption handle for this thread: it is not preempted asynchronously");
     return h;
 }
 
-static DWORD WINAPI thread_main(void *p) {
+static void thread_main(void *p) {
     RtThread *t = p;
     tcur = t;
-    t->tid = GetCurrentThreadId();
-    HANDLE self = ap_open_self();
+    t->tid = plat_thread_id();
+    PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
-    while (!t->started) SleepConditionVariableSRW(&t->cv, &G, INFINITE, 0);
+    while (!t->started) plat_cond_wait(&t->cv, &G);
     core_take(t);
     unlock();
     Cpu *c = t->cpu;
     c->sp = t->stack_top & ~15ull;
-    if (!setjmp(t->exit_jmp)) {
+    if (!plat_jmp_save(&t->exit_jmp)) {
         rt_call(c, t->entry, 1, t->arg);
         char d[128];
         rt_fatal("guest thread %#x: entry %s returned (Horizon threads end with ExitThread)", t->handle,
                  ldr_describe(t->entry, d, sizeof d));
     }
     thread_finish(tcur);
-    return 0;
+    return;
 }
 
 uint64_t kern_threads_created(void) {
@@ -1631,17 +1666,16 @@ uint32_t kern_main_thread(Cpu **cpu) {
     if (g_main) rt_fatal("kern_main_thread: the main thread already runs on another host thread");
     const RtGuestLayout *L = mem_layout();
     uint64_t stack = L->stack.base + L->stack.size - MAIN_STACK;
-    if (!VirtualAlloc((void *)(uintptr_t)stack, MAIN_STACK, MEM_COMMIT, PAGE_READWRITE))
-        rt_fatal("kernel: commit the main thread stack at %#llx failed (error %lu)", (unsigned long long)stack,
-                 GetLastError());
+    if (!plat_mem_commit(stack, MAIN_STACK))
+        rt_fatal("kernel: commit the main thread stack at %#llx failed", (unsigned long long)stack);
     RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, 7);
     t->started = 1;
     t->is_main = 1;
     t->stack_top = stack + MAIN_STACK;
     t->cpu->sp = t->stack_top;
-    t->tid = GetCurrentThreadId();
+    t->tid = plat_thread_id();
     perf_main_thread();
-    HANDLE self = ap_open_self();
+    PlatIntr *self = ap_open_self();
     lock();
     t->hthr = self;
     thr_link(t);
@@ -1660,44 +1694,33 @@ void kern_main_stack(uint64_t *base, uint64_t *size) {
     *size = b ? MAIN_STACK : 0;
 }
 
-static DWORD WINAPI guest_main(void *p) {
+static void guest_main(void *p) {
     void (*fn)(Cpu *) = (void (*)(Cpu *))p;
     Cpu *c;
     kern_main_thread(&c);
-    if (!setjmp(tcur->exit_jmp)) fn(c);
+    if (!plat_jmp_save(&tcur->exit_jmp)) fn(c);
     thread_finish(tcur);
-    return 0;
+    return;
 }
 
 void kern_run_on_guest_main(void (*fn)(Cpu *c)) {
-    HANDLE h = CreateThread(NULL, HOST_STACK, guest_main, (void *)fn, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (!h) rt_fatal("kernel: CreateThread for the guest main thread failed (error %lu)", GetLastError());
-    WaitForSingleObject(h, INFINITE);
-    CloseHandle(h);
+    PlatThread *h = plat_thread_new_ex(guest_main, (void *)fn, "guest main", HOST_STACK);
+    if (!h) rt_fatal("kernel: cannot start the guest main thread");
+    plat_thread_join(h);
 }
 
-// The high-resolution waitable timer ends a wait 0.3-0.5 ms late at best: the SDK's 20 us polling sleeps (main thread
-// and job workers, about 1.5 per frame each) took 460-515 us. Sleeps up to SLEEP_SPIN_NS spin on the performance
-// counter instead; the virtual core is already given up. Linux: clock_nanosleep wakes within about 50 us (timer slack),
-// so a Linux host spins only below that, or not at all.
-#define SLEEP_SPIN_NS 1000000
+// The OS timer ends a wait late by up to PLAT_WAIT_LATE_NS (Windows' high-resolution waitable timer: 0.3-0.5 ms; the
+// SDK's 20 us polling sleeps, main thread and job workers, about 1.5 per frame each, took 460-515 us). Sleeps up to
+// twice that spin on the clock instead (1 ms on Windows, 120 us on Linux); the virtual core is already given up.
+#define SLEEP_SPIN_NS (2 * PLAT_WAIT_LATE_NS)
 static void sleep_ns(RtThread *t, int64_t ns) {
+    (void)t;
     if (ns <= SLEEP_SPIN_NS) {
         uint64_t end = kern_now_ns() + (uint64_t)ns;
-        while (kern_now_ns() < end) YieldProcessor();
+        while (kern_now_ns() < end) plat_pause();
         return;
     }
-    if (!t->timer) {
-        t->timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!t->timer) t->timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
-        if (!t->timer) rt_fatal("kernel: CreateWaitableTimerExW failed (error %lu)", GetLastError());
-    }
-    LARGE_INTEGER due;
-    int64_t units = ns / 100 + (ns % 100 != 0);   // 100 ns units, rounded up
-    due.QuadPart = -(units > 0 ? units : 1);
-    if (!SetWaitableTimer(t->timer, &due, 0, NULL, NULL, FALSE))
-        rt_fatal("kernel: SetWaitableTimer failed (error %lu)", GetLastError());
-    WaitForSingleObject(t->timer, INFINITE);
+    plat_wait_ns((uint64_t)ns);
 }
 
 // ---- synchronization objects
@@ -1786,9 +1809,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         lock();
         thr_link(t);
         unlock();
-        HANDLE h = CreateThread(NULL, HOST_STACK, thread_main, t, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-        if (!h) rt_fatal("kernel: CreateThread failed (error %lu)", GetLastError());
-        CloseHandle(h);
+        if (!plat_thread_spawn(thread_main, t, "guest", HOST_STACK)) rt_fatal("kernel: cannot start a guest thread");
         if (rt_trace & RT_TRACE_SVC) {
             char d[128];
             rt_log("CreateThread %#x entry %s stack %#llx prio %d core %d", t->handle,
@@ -1803,7 +1824,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
         RtThread *t = h_get((uint32_t)x[0], O_THREAD);
         if (t) {
             t->started = 1;
-            WakeConditionVariable(&t->cv);
+            plat_cond_signal(&t->cv);
         }
         unlock();
         x[0] = t ? R_OK : R_BAD_HANDLE;
@@ -1816,7 +1837,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             t->leaving = t->fiber;
             t->fiber = NULL;
             t->cur = t->cpu;
-            SwitchToFiber(t->base_fiber);
+            plat_fiber_switch(t->base_fiber);
             rt_fatal("kernel: ExitThread on a fiber came back");
         }
         exit_now(t);
@@ -1853,7 +1874,7 @@ int kern_svc(Cpu *c, uint32_t imm) {
             core_take(t);
         }
         unlock();
-        if (!give) SwitchToThread();
+        if (!give) plat_yield();
         return 1;
     }
     case 0x0C: {   // GetThreadPriority(w1 handle -> w1)
@@ -2208,14 +2229,14 @@ void kern_event_signal(uint32_t hw) {
 // guest thread; the writable handle is kept, so any thread (host audio tick included) can signal it later.
 static struct { uint64_t ev; uint32_t wh; } g_se[512];
 static int g_nse;
-static SRWLOCK g_se_lock = SRWLOCK_INIT;
+static PlatMutex g_se_lock = PLAT_MUTEX_INIT;
 
 static uint32_t se_find(uint64_t ev) {
-    AcquireSRWLockShared(&g_se_lock);
+    plat_mutex_lock_shared(&g_se_lock);
     uint32_t wh = 0;
     for (int i = 0; i < g_nse && !wh; i++)
         if (g_se[i].ev == ev) wh = g_se[i].wh;
-    ReleaseSRWLockShared(&g_se_lock);
+    plat_mutex_unlock_shared(&g_se_lock);
     return wh;
 }
 
@@ -2231,11 +2252,11 @@ void kern_bind_system_event(Cpu *c, uint64_t ev, int autoclear) {
     uint32_t r = (uint32_t)rt_call(c, create, 3, ev, (uint64_t)(autoclear ? 1 : 0), (uint64_t)1);
     if (r) rt_fatal("kern_bind_system_event: CreateSystemEvent(%#llx) failed %#x", (unsigned long long)ev, r);
     uint32_t wh = (uint32_t)rt_call(c, getw, 1, ev);
-    AcquireSRWLockExclusive(&g_se_lock);
+    plat_mutex_lock(&g_se_lock);
     if (g_nse == (int)(sizeof g_se / sizeof *g_se)) rt_fatal("kern_bind_system_event: table full");
     g_se[g_nse].ev = ev;
     g_se[g_nse++].wh = wh;
-    ReleaseSRWLockExclusive(&g_se_lock);
+    plat_mutex_unlock(&g_se_lock);
 }
 
 // An event not bound yet is bound on the spot with manual clear, which needs a guest thread.
@@ -2257,28 +2278,29 @@ enum { F_NEW, F_STARTED, F_DONE };
 struct Fiber {
     uint64_t addr, func, arg, stack, size;
     Cpu *cpu;
-    void *host;
+    PlatFiber *host;
     int state;
     volatile int running;
 };
 static Fiber *g_fibers[FIBER_MAX];
-static SRWLOCK g_fiber_lock = SRWLOCK_INIT;
+static PlatMutex g_fiber_lock = PLAT_MUTEX_INIT;
 
 static Fiber *fiber_find(uint64_t addr) {
     Fiber *f = NULL;
-    AcquireSRWLockShared(&g_fiber_lock);
+    plat_mutex_lock_shared(&g_fiber_lock);
     for (int i = 0; i < FIBER_MAX && !f; i++)
         if (g_fibers[i] && g_fibers[i]->addr == addr) f = g_fibers[i];
-    ReleaseSRWLockShared(&g_fiber_lock);
+    plat_mutex_unlock_shared(&g_fiber_lock);
     return f;
 }
 
 static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to);
 
-// After a host fiber switch: release the context left behind, and finish an ExitThread issued on a fiber.
-static void fiber_resumed(void) {
+// After a host fiber switch: release the context left behind, and finish an ExitThread issued on a fiber. noinline: a
+// fiber may resume on another host thread, so tcur has to be read here, after the switch, never reused from before it.
+static __attribute__((noinline)) void fiber_resumed(void) {
     RtThread *t = tcur;
-    rt_fpcr_sync(t->cur);   // the host fiber resumes with its own MXCSR (FIBER_FLAG_FLOAT_SWITCH)
+    rt_fpcr_sync(t->cur);   // the host fiber resumes with its own MXCSR (platform.h fibers switch it)
     if (t->leaving) {
         __atomic_store_n(&t->leaving->running, 0, __ATOMIC_RELEASE);
         t->leaving = NULL;
@@ -2286,7 +2308,7 @@ static void fiber_resumed(void) {
     if (t->exit_pending && !t->fiber) exit_now(t);
 }
 
-static void WINAPI fiber_main(void *p) {
+static void fiber_main(void *p) {
     Fiber *f = p;
     fiber_resumed();
     Cpu *c = f->cpu;
@@ -2303,8 +2325,8 @@ static void WINAPI fiber_main(void *p) {
 
 static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     if (!t->base_fiber) {
-        t->base_fiber = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
-        if (!t->base_fiber) rt_fatal("kernel: ConvertThreadToFiberEx failed (error %lu)", GetLastError());
+        t->base_fiber = plat_fiber_self();
+        if (!t->base_fiber) rt_fatal("kernel: cannot make the thread a fiber");
     }
     Cpu *dst = to ? to->cpu : t->cpu;
     if (to) {
@@ -2327,7 +2349,7 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     t->fiber = to;
     t->cur = dst;
     int depth = t->host_depth;
-    SwitchToFiber(to ? to->host : t->base_fiber);
+    plat_fiber_switch(to ? to->host : t->base_fiber);
     t->host_depth = depth;
     fiber_resumed();
 }
@@ -2339,17 +2361,17 @@ void kern_fiber_initialize(Cpu *c) {
     if (f && f->running) rt_fatal("InitializeFiber(%#llx): the fiber is running", (unsigned long long)addr);
     if (!f) {
         f = calloc(1, sizeof *f);
-        Cpu *fc = _aligned_malloc(sizeof(Cpu), 64);
+        Cpu *fc = plat_aligned_alloc(sizeof(Cpu), 64);
         if (!f || !fc) rt_fatal("kernel: fiber allocation");
         f->cpu = fc;
-        AcquireSRWLockExclusive(&g_fiber_lock);
+        plat_mutex_lock(&g_fiber_lock);
         int i = 0;
         while (i < FIBER_MAX && g_fibers[i]) i++;
         if (i == FIBER_MAX) rt_fatal("kernel: more than %d fibers", FIBER_MAX);
         g_fibers[i] = f;
-        ReleaseSRWLockExclusive(&g_fiber_lock);
+        plat_mutex_unlock(&g_fiber_lock);
     } else if (f->host) {
-        DeleteFiber(f->host);
+        plat_fiber_free(f->host);
     }
     memset(f->cpu, 0, sizeof *f->cpu);
     f->cpu->excl_addr = ~0ull;
@@ -2360,25 +2382,25 @@ void kern_fiber_initialize(Cpu *c) {
     f->size = c->x[4];
     f->state = F_NEW;
     f->running = 0;
-    f->host = CreateFiberEx(0x10000, HOST_STACK, FIBER_FLAG_FLOAT_SWITCH, fiber_main, f);
-    if (!f->host) rt_fatal("kernel: CreateFiberEx failed (error %lu)", GetLastError());
+    f->host = plat_fiber_new(HOST_STACK, fiber_main, f);
+    if (!f->host) rt_fatal("kernel: cannot create a host fiber");
 }
 
 // FinalizeFiber(x0 FiberType*)
 void kern_fiber_finalize(Cpu *c) {
     uint64_t addr = c->x[0];
-    AcquireSRWLockExclusive(&g_fiber_lock);
+    plat_mutex_lock(&g_fiber_lock);
     Fiber *f = NULL;
     for (int i = 0; i < FIBER_MAX && !f; i++)
         if (g_fibers[i] && g_fibers[i]->addr == addr) {
             f = g_fibers[i];
             g_fibers[i] = NULL;
         }
-    ReleaseSRWLockExclusive(&g_fiber_lock);
+    plat_mutex_unlock(&g_fiber_lock);
     if (!f) rt_fatal("FinalizeFiber(%#llx): not an initialized fiber", (unsigned long long)addr);
     if (f->running) rt_fatal("FinalizeFiber(%#llx): the fiber is running", (unsigned long long)addr);
-    DeleteFiber(f->host);
-    _aligned_free(f->cpu);
+    plat_fiber_free(f->host);
+    plat_aligned_free(f->cpu);
     free(f);
 }
 

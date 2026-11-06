@@ -29,6 +29,10 @@
 #include "platform/platform.h"
 #include "tex.h"
 #include "vk.h"
+
+#ifndef MAX_PATH
+#define MAX_PATH 260   // the buffers keep the Windows sizes (MAX_PATH * 3) on both systems
+#endif
 #include "vk_exec.h"
 
 #define WEAK __attribute__((weak))
@@ -967,6 +971,8 @@ void vk_exec_fault_ops(void) {
     char path[MAX_PATH * 3];
     snprintf(path, sizeof path, "%s", log);
     char *cut = strrchr(path, '\\');
+    char *slash = strrchr(path, '/');   // Linux log paths use '/'
+    if (slash && (!cut || slash > cut)) cut = slash;
     snprintf(cut ? cut + 1 : path, sizeof path - (size_t)(cut ? cut + 1 - path : 0), "fault-ops.txt");
     FILE *f = fopen(path, "w");
     if (!f) return;

@@ -21,11 +21,13 @@
 // Also here: the runtime services the generated code calls besides rt_dispatch and rt_svc (rt_brk, rt_udf,
 // rt_ticks, the function profiler hook), logging, SHA-256, and the crash reporter (a vectored exception handler that
 // names the lifted function, the guest registers and the guest frame-pointer chain).
-#include <windows.h>
-#include <bcrypt.h>
 #include <limits.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <windows.h>   // the crash reporter, the 1 ms timer and the process memory counters
 #include <psapi.h>
 #include <timeapi.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +36,8 @@
 #include "gfx.h"
 #include "host.h"
 #include "platform/platform.h"
+
+#define MAIN_PATH_MAX 4096
 
 #define MAX_MODULES 16
 
@@ -50,7 +54,7 @@ unsigned rt_trace;
 enum { LOG_EARLY, LOG_FILE, LOG_OFF };
 static int g_log_state;
 static PlatAppend *g_log_file;
-static char g_log_path[MAX_PATH * 3];
+static char g_log_path[MAIN_PATH_MAX * 3];
 static char g_log_early[32768];
 static size_t g_log_early_n;
 static uint64_t g_log_bytes;
@@ -104,7 +108,7 @@ const char *rt_log_path(void) {
 // Opens the log file for a game run (game = 1) and writes the buffered lines to it; anything else drops them. Runs on
 // the main thread before the boot starts other threads.
 static void log_open(int game) {
-    char dir[MAX_PATH * 3], from[MAX_PATH * 3 + 16], to[MAX_PATH * 3 + 16];
+    char dir[MAIN_PATH_MAX * 3], from[MAIN_PATH_MAX * 3 + 16], to[MAIN_PATH_MAX * 3 + 16];
     char *cut = NULL;
     if (game && !plat_stderr_path(dir, sizeof dir) && plat_exe_path(dir, sizeof dir)) {
         cut = strrchr(dir, '\\');
@@ -156,27 +160,7 @@ static void parse_trace(void) {
 }
 
 void rt_sha256(const void *p, size_t n, uint8_t out[32]) {
-    static BCRYPT_ALG_HANDLE alg;
-    BCRYPT_ALG_HANDLE a = __atomic_load_n(&alg, __ATOMIC_ACQUIRE);
-    if (!a) {
-        if (BCryptOpenAlgorithmProvider(&a, BCRYPT_SHA256_ALGORITHM, NULL, 0)) rt_fatal("SHA-256 provider unavailable");
-        BCRYPT_ALG_HANDLE expected = NULL;
-        if (!__atomic_compare_exchange_n(&alg, &expected, a, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            BCryptCloseAlgorithmProvider(a, 0);
-            a = expected;
-        }
-    }
-    BCRYPT_HASH_HANDLE h;
-    if (BCryptCreateHash(a, &h, NULL, 0, NULL, 0, 0)) rt_fatal("SHA-256: BCryptCreateHash failed");
-    const uint8_t *s = p;
-    while (n) {
-        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
-        if (BCryptHashData(h, (PUCHAR)s, k, 0)) rt_fatal("SHA-256: BCryptHashData failed");
-        s += k;
-        n -= k;
-    }
-    if (BCryptFinishHash(h, out, 32, 0)) rt_fatal("SHA-256: BCryptFinishHash failed");
-    BCryptDestroyHash(h);
+    if (!plat_sha256(p, n, out)) rt_fatal("SHA-256 failed");
 }
 
 // ---- configuration
@@ -196,7 +180,7 @@ volatile int g_fnprof = 0;
 #define BREAK_MAX 8
 static struct { char module[16]; uint64_t offset, addr; } g_breaks[BREAK_MAX], g_watches[BREAK_MAX];
 static int g_break_count, g_watch_count;
-static volatile LONG g_break_hits;
+static volatile int32_t g_break_hits;
 
 static void break_init(void) {
     const char *e = cfg_get("OOT_BREAK_AT");
@@ -223,11 +207,13 @@ static void break_init(void) {
     g_fnprof = 1;
 }
 
+// Guest memory is reserved by the platform layer (memory.c), so plat_mem_state answers for every address the guest uses.
 static int guest_readable(uint64_t a, size_t n) {
-    MEMORY_BASIC_INFORMATION mbi;
-    if (!a || !VirtualQuery((const void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
-    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return 0;
-    return (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize >= a + n;
+    if (!a) return 0;
+    uint64_t end = 0;
+    int st = plat_mem_state(a, a + n, &end);
+    if (st == PLAT_PROT_NONE || st == PLAT_MEM_RESERVED || st == PLAT_MEM_FREE) return 0;
+    return end >= a + n;
 }
 
 static void break_dump(const char *what, uint64_t a, size_t n) {
@@ -271,7 +257,7 @@ static void break_follow(const Cpu *c) {
 
 void fnprof_hit(uint64_t addr, void *cpu) {
     const Cpu *c = cpu;
-    static volatile LONG resolved;
+    static volatile int32_t resolved;
     if (!resolved) {
         for (int k = 0; k < g_break_count; k++)
             for (int i = 0; i < ldr_count(); i++)
@@ -281,7 +267,7 @@ void fnprof_hit(uint64_t addr, void *cpu) {
             for (int i = 0; i < ldr_count(); i++)
                 if (!strcmp(ldr_module(i)->name, g_watches[k].module))
                     g_watches[k].addr = ldr_module(i)->base + g_watches[k].offset;
-        InterlockedExchange(&resolved, 1);
+        __atomic_exchange_n(&resolved, 1, __ATOMIC_SEQ_CST);
     }
     for (int k = 0; k < g_break_count; k++) {
         if (addr != g_breaks[k].addr) continue;
@@ -293,15 +279,15 @@ void fnprof_hit(uint64_t addr, void *cpu) {
         if (count < 0) { const char *e = cfg_get("OOT_BREAK_COUNT"); count = e && !strcmp(e, "1"); }
         if (count) {
             enum { NC = 1024 };
-            static struct { uint64_t lr; volatile LONG n; } cs[NC];
-            static SRWLOCK cl = SRWLOCK_INIT;
+            static struct { uint64_t lr; volatile int32_t n; } cs[NC];
+            static PlatMutex cl = PLAT_MUTEX_INIT;
             static uint64_t t_last;
             uint64_t lr = c->x[30] - 4;
-            AcquireSRWLockExclusive(&cl);
+            plat_mutex_lock(&cl);
             uint32_t h = (uint32_t)((lr >> 2) * 0x9e3779b1u) & (NC - 1);
             while (cs[h].lr && cs[h].lr != lr) h = (h + 1) & (NC - 1);
             cs[h].lr = lr, cs[h].n++;
-            uint64_t now = GetTickCount64();
+            uint64_t now = plat_tick_ms();
             if (!t_last) t_last = now;
             if (now - t_last >= 10000) {
                 t_last = now;
@@ -318,12 +304,12 @@ void fnprof_hit(uint64_t addr, void *cpu) {
                 }
                 for (int i = 0; i < NC; i++) cs[i].n = 0;
             }
-            ReleaseSRWLockExclusive(&cl);
+            plat_mutex_unlock(&cl);
             continue;
         }
         static int brief = -1;
         if (brief < 0) brief = !strcmp(cfg_value("OOT_BREAK_BRIEF"), "1");
-        LONG hits = InterlockedIncrement(&g_break_hits);
+        int32_t hits = __atomic_add_fetch(&g_break_hits, 1, __ATOMIC_SEQ_CST);
         if (hits > (brief ? 400000 : 4000)) return;
         char at[128], lr[128];
         if (brief) {
@@ -372,19 +358,14 @@ void rt_udf(Cpu *c, uint64_t pc) {
 // CNTPCT_EL0: the Switch counter runs at 19.2 MHz. The scale is set before main, so no thread reads it half written.
 static PlatScale tick_scale;
 
-__attribute__((constructor)) static void tick_scale_init(void) {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    tick_scale = plat_scale(19200000u, (uint64_t)f.QuadPart);
-}
+static uint64_t g_start_ns;
+double rt_uptime_s(void) { return (double)(plat_now_ns() - g_start_ns) / 1e9; }
+__attribute__((constructor)) static void uptime_init(void) { g_start_ns = plat_now_ns(); }
+__attribute__((constructor)) static void tick_scale_init(void) { tick_scale = plat_scale(19200000u, 1000000000u); }
 
-uint64_t rt_ticks(void) {
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return plat_scaled(tick_scale, (uint64_t)t.QuadPart);
-}
+uint64_t rt_ticks(void) { return plat_scaled(tick_scale, plat_now_ns()); }
 
-// ---- crash reporter
+#ifdef _WIN32
 typedef struct { uintptr_t host; uint64_t guest; } FnRev;
 static FnRev *fn_rev;
 static uint64_t fn_rev_n;
@@ -425,7 +406,7 @@ static int readable(uint64_t a, uint64_t n) {
 }
 
 static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
-    static volatile LONG busy;
+    static volatile int32_t busy;
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
         code != EXCEPTION_INT_DIVIDE_BY_ZERO && code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_STACK_OVERFLOW &&
@@ -437,13 +418,13 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     if (!GetModuleInformation(GetCurrentProcess(), self, &mi, sizeof mi) || rip - (uintptr_t)mi.lpBaseOfDll >= mi.SizeOfImage) {
         // Not our code: left to the handler that expects it, but said once, as a process that dies in a driver or
         // a DLL otherwise leaves no trace (2026-11-05: exit code 40 after frame 1, no FATAL line).
-        static volatile LONG foreign;
-        if (InterlockedIncrement(&foreign) <= 4) {
+        static volatile int32_t foreign;
+        if (__atomic_add_fetch(&foreign, 1, __ATOMIC_SEQ_CST) <= 4) {
             HMODULE m = NULL;
-            wchar_t name[MAX_PATH] = L"?";
+            wchar_t name[MAIN_PATH_MAX] = L"?";
             if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                    (LPCWSTR)rip, &m) && m)
-                GetModuleFileNameW(m, name, MAX_PATH);
+                GetModuleFileNameW(m, name, MAIN_PATH_MAX);
             rt_logf("exception %#lx at host %p (%ls+%#llx, thread %lu), left to its own handler\n", code, (void *)rip, name,
                     (unsigned long long)(m ? rip - (uintptr_t)m : 0), GetCurrentThreadId());
             // Where it came from, for an address in no module (a jump through a bad pointer): the registers, the
@@ -473,7 +454,7 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
         }
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    if (InterlockedExchange(&busy, 1)) ExitProcess(71);
+    if (__atomic_exchange_n(&busy, 1, __ATOMIC_SEQ_CST)) ExitProcess(71);
     char d[160];
     rt_logf("FATAL: exception %#lx at host %p (oot.exe+%#llx)", code, (void *)rip,
             (unsigned long long)(rip - (uintptr_t)mi.lpBaseOfDll));
@@ -544,17 +525,31 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     fflush(stderr);
     ExitProcess(71);
 }
+#endif
 
 // ---- self-test: layout, dispatch table, host-function registry, without game files
+
+// A block aligned to 64 bytes for the probe's Cpu: _aligned_malloc on Windows, aligned_alloc elsewhere.
+static void *aligned_block(size_t n) {
+#ifdef _WIN32
+    return _aligned_malloc(n, 64);
+#else
+    return aligned_alloc(64, (n + 63) & ~(size_t)63);
+#endif
+}
+
+static void aligned_block_free(void *p) {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)
 
-static double now_s(void) {
-    LARGE_INTEGER t, f;
-    QueryPerformanceCounter(&t);
-    QueryPerformanceFrequency(&f);
-    return (double)t.QuadPart / (double)f.QuadPart;
-}
+static double now_s(void) { return (double)plat_now_ns() / 1e9; }
 
 static volatile int host_probe_hits;
 static void host_probe(Cpu *c) { host_probe_hits++; c->x[0] = 42; }
@@ -581,9 +576,8 @@ static void check_layout(void) {
             CHECK(lay[i].base > lay[i - 1].base, "%s base is not above %s", lay[i].name, lay[i - 1].name);
             CHECK(lay[i - 1].base + lay[i - 1].size <= lay[i].base, "%s overlaps %s", lay[i - 1].name, lay[i].name);
         }
-        MEMORY_BASIC_INFORMATION mbi;
-        int ours = VirtualQuery((void *)(uintptr_t)lay[i].base, &mbi, sizeof mbi) && mbi.State == MEM_RESERVE &&
-                   (uint64_t)(uintptr_t)mbi.AllocationBase <= lay[i].base;
+        uint64_t end = 0;
+        int ours = plat_mem_state(lay[i].base, lay[i].base + 1, &end) == PLAT_MEM_RESERVED;
         CHECK(ours, "%s is not inside the reserved module window", lay[i].name);
     }
     const RtGuestLayout *g = mem_layout();
@@ -703,14 +697,14 @@ static int selftest(void) {
            (double)s.table_bytes / (1 << 20), dt * 1e3);
     check_modules(mods, n);
     CHECK(s.functions > 0, "no functions linked");
-    Cpu *c = _aligned_malloc(sizeof(Cpu), 64);
+    Cpu *c = aligned_block(sizeof(Cpu));
     memset(c, 0, sizeof *c);
     uint64_t r = rt_call(c, probe, 1, (uint64_t)7);
     CHECK(rt_dispatch_lookup(probe) && r == 42 && host_probe_hits == 1 && c->x[30] == 0,
           "a registered host function does not dispatch through rt_call");
     CHECK(!rt_dispatch_lookup(probe + 16), "an unregistered host-function address dispatches");
     CHECK(rt_dispatch_lookup(RT_RET_HOST), "the rt_call return sentinel is not registered");
-    _aligned_free(c);
+    aligned_block_free(c);
     bench(mods, n);
 
     void *k1 = mem_kernel_alloc(0x200, 16), *k2 = mem_kernel_alloc(0x2000, 0x1000);
@@ -720,9 +714,15 @@ static int selftest(void) {
     CHECK(mem_kernel_alloc(0x200, 16) == k1, "a freed kernel-region block is not reused");
     check_memory();
 
+#ifdef _WIN32
     PROCESS_MEMORY_COUNTERS pmc = {.cb = sizeof pmc};
     if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc))
         printf("process: peak working set %.1f MiB\n", (double)pmc.PeakWorkingSetSize / (1 << 20));
+#else
+    float used_mb, total_mb, proc_mb;
+    plat_mem_info(&used_mb, &total_mb, &proc_mb);
+    printf("process: working set %.1f MiB\n", (double)proc_mb);
+#endif
     printf("selftest: %s (%d failures)\n", failures ? "FAILED" : "passed", failures);
     return failures ? 1 : 0;
 }
@@ -738,7 +738,7 @@ static int usage(const char *argv0) {
 // Paths for a copied folder (tools/package_build.py). Per path: OOT_EXEFS, OOT_ROMFS, OOT_PROFILE_DIR, else the
 // folder next to oot.exe (exefs, romfs, profile) if it exists, else the path baked in at build time. A relative
 // value is relative to oot.exe's folder.
-static char pp_exefs[MAX_PATH * 2], pp_romfs[MAX_PATH * 2], pp_profile[MAX_PATH * 2];
+static char pp_exefs[MAIN_PATH_MAX * 2], pp_romfs[MAIN_PATH_MAX * 2], pp_profile[MAIN_PATH_MAX * 2];
 
 static const char *portable_path(const char *dir, const char *var, const char *sub, const char *must, char *out, size_t cap,
                                  const char *fallback) {
@@ -746,19 +746,21 @@ static const char *portable_path(const char *dir, const char *var, const char *s
     if (e && *e) {
         int abs_path = e[0] == '\\' || e[0] == '/' || e[1] == ':';
         if (abs_path) snprintf(out, cap, "%s", e);
-        else snprintf(out, cap, "%s\\%s", dir, e);
+        else snprintf(out, cap, "%s/%s", dir, e);
         return out;
     }
-    char probe[MAX_PATH * 3];
-    snprintf(out, cap, "%s\\%s", dir, sub);
-    snprintf(probe, sizeof probe, "%s\\%s", out, must);
-    return GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES ? out : fallback;
+    char probe[MAIN_PATH_MAX * 3];
+    snprintf(out, cap, "%s/%s", dir, sub);
+    snprintf(probe, sizeof probe, "%s/%s", out, must);
+    struct stat st;
+    return stat(probe, &st) == 0 ? out : fallback;
 }
 
 static void portable_paths(RtConfig *c) {
-    char exe[MAX_PATH * 2];
-    DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
-    char *cut = n && n < sizeof exe ? strrchr(exe, '\\') : NULL;
+    char exe[MAIN_PATH_MAX * 2];
+    int ok = plat_exe_path(exe, sizeof exe);
+    char *cut = ok ? strrchr(exe, '/') : NULL, *bcut = ok ? strrchr(exe, '\\') : NULL;
+    if (bcut && (!cut || bcut > cut)) cut = bcut;
     if (!cut) return;
     *cut = 0;
     c->exefs = portable_path(exe, "OOT_EXEFS", "exefs", "main.npdm", pp_exefs, sizeof pp_exefs, c->exefs);
@@ -770,12 +772,16 @@ int main(int argc, char **argv) {
     mem_init();   // first: claim the guest address space before anything else can land there; reads oot.ini
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+#ifdef _WIN32
     AddVectoredExceptionHandler(0, crash_handler);
+#endif
     parse_trace();
     prof_start();
     // Timed guest waits (kernel.c block_inner) sleep in whole milliseconds; at the default 15.6 ms tick a 1 ms wait
     // costs a full tick. OOT_TIMER_1MS=0 keeps the default for comparison.
+#ifdef _WIN32
     if (cfg_bool("OOT_TIMER_1MS")) timeBeginPeriod(1);
+#endif
     cfg = (RtConfig){.exefs = rt_default_exefs, .romfs = rt_default_romfs, .profile = rt_default_profile,
                      .gpu = cfg_get("OOT_GPU")};
     portable_paths(&cfg);   // command-line paths below still win

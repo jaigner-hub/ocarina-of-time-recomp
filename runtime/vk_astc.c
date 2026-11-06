@@ -21,7 +21,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #include "astc_decode_spv.h"
 #include "bc3_encode_spv.h"
@@ -29,6 +28,7 @@
 #include "host.h"
 #include "tex.h"
 #include "vk.h"
+#include "platform/platform.h"
 
 // tex_astc.c's unquantization tables, as the shader reads them (Tables in astc_decode.comp): 12 + 16 row offsets in
 // bytes, then the bytes. Kept in step with tex_astc.c by the oracle (--probe-astc), which compares every mode.
@@ -99,7 +99,7 @@ typedef struct {
     uint32_t in_base, out_base, width, height, bw, bh, bx, bslice, srgb;
 } Push;
 
-static SRWLOCK g_lock = SRWLOCK_INIT;
+static PlatMutex g_lock = PLAT_MUTEX_INIT;
 static struct {
     VkDevice dev;                 // the device the objects below belong to (probes recreate it)
     int mode;                     // VK_ASTC_*; -1 before the first vk_astc_mode with a device
@@ -121,7 +121,7 @@ static uint64_t n_dispatch, n_texels, n_chunks;   // n_chunks: the breadcrumb nu
 // read back by later calls. Per footprint: texels and dispatch time; a new largest call is logged with both times.
 // Needs hostQueryReset (a slot is reset on the host after its read).
 #define TQ 256
-static SRWLOCK t_lock = SRWLOCK_INIT;
+static PlatMutex t_lock = PLAT_MUTEX_INIT;
 static int t_on = -1;                 // -1: knob not read yet
 static VkQueryPool t_pool;
 static VkDevice t_dev;
@@ -213,26 +213,26 @@ static int time_slot(uint32_t id, uint8_t fp, uint64_t texels, int whole) {
 }
 
 void vk_astc_time_enable(int on) {
-    AcquireSRWLockExclusive(&t_lock);
+    plat_mutex_lock(&t_lock);
     t_on = on;
-    ReleaseSRWLockExclusive(&t_lock);
+    plat_mutex_unlock(&t_lock);
 }
 
 int vk_astc_time_get(uint32_t bw, uint32_t bh, uint64_t *texels, uint64_t *calls, double *us) {
     VkCtx *c = vk_ctx();
     if (!c || bw > 12 || bh > 12) return 0;
-    AcquireSRWLockExclusive(&t_lock);
+    plat_mutex_lock(&t_lock);
     time_poll_locked(c);
     int fp = (int)(bw * 13 + bh);
     *texels = t_fp[fp].texels, *calls = t_fp[fp].chunks, *us = t_fp[fp].us;
-    ReleaseSRWLockExclusive(&t_lock);
+    plat_mutex_unlock(&t_lock);
     return 1;
 }
 
 void vk_astc_time_summary(void) {
     VkCtx *c = vk_ctx();
     if (!c) return;
-    AcquireSRWLockExclusive(&t_lock);
+    plat_mutex_lock(&t_lock);
     if (t_on > 0) {
         time_poll_locked(c);
         for (int fp = 0; fp < 13 * 13; fp++)
@@ -244,7 +244,7 @@ void vk_astc_time_summary(void) {
             rt_log("vk: ASTC time: largest decode %.2f M texels (%dx%d): dispatches %.0f us GPU, %.0f us with the copies",
                    (double)t_max_texels / 1e6, t_max_fp / 13, t_max_fp % 13, t_max_us, t_max_total);
     }
-    ReleaseSRWLockExclusive(&t_lock);
+    plat_mutex_unlock(&t_lock);
 }
 
 static void fill_tables(uint8_t *p) {
@@ -284,8 +284,7 @@ static int create_pipeline(VkCtx *c) {
                                      .pSetLayouts = &G.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     if (vkCreatePipelineLayout(c->device, &li, NULL, &G.layout) != VK_SUCCESS) return 0;
     if (vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS) return 0;
-    LARGE_INTEGER t0, t1, fq;
-    QueryPerformanceCounter(&t0);
+    uint64_t t0 = plat_now_ns();
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
@@ -297,9 +296,7 @@ static int create_pipeline(VkCtx *c) {
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo aci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     if (vmaCreateBuffer(c->vma, &bi, &aci, &G.tab, &G.tab_alloc, NULL) != VK_SUCCESS) return 0;
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&fq);
-    rt_log("vk: ASTC compute decoder ready (pipeline built in %.1f ms)", (double)(t1.QuadPart - t0.QuadPart) * 1e3 / (double)fq.QuadPart);
+    rt_log("vk: ASTC compute decoder ready (pipeline built in %.1f ms)", (double)(plat_now_ns() - t0) / 1e6);
     return 1;
 }
 
@@ -342,11 +339,11 @@ static const char *mode_name(int m) {
 int vk_astc_mode(void) {
     VkCtx *c = vk_ctx();
     if (!c) return VK_ASTC_CPU;
-    AcquireSRWLockShared(&g_lock);
+    plat_mutex_lock_shared(&g_lock);
     int m = G.dev == c->device ? G.mode : -1;
-    ReleaseSRWLockShared(&g_lock);
+    plat_mutex_unlock_shared(&g_lock);
     if (m >= 0) return m;
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_lock(&g_lock);
     reset_for(c);
     if (G.mode < 0) {
         const char *e = cfg_value("OOT_ASTC");
@@ -369,7 +366,7 @@ int vk_astc_mode(void) {
         rt_log("vk: ASTC textures: %s (textureCompressionASTC_LDR %d)", mode_name(m), native_device(c));
     }
     m = G.mode;
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
     return m;
 }
 
@@ -387,18 +384,18 @@ int vk_astc_gpu(void) {
     int m = vk_astc_mode();
     if (m == VK_ASTC_GPU || m == VK_ASTC_CHECK) return 1;
     if (m != VK_ASTC_NATIVE) return 0;
-    AcquireSRWLockShared(&g_lock);   // native mode, a format the device lacks: the decoder when it exists
+    plat_mutex_lock_shared(&g_lock);   // native mode, a format the device lacks: the decoder when it exists
     int ok = G.pipe != VK_NULL_HANDLE;
-    ReleaseSRWLockShared(&g_lock);
+    plat_mutex_unlock_shared(&g_lock);
     return ok;
 }
 
 int vk_astc_bc(void) {
     VkCtx *c = vk_ctx();
     if (!c || vk_astc_mode() != VK_ASTC_GPU) return 0;
-    AcquireSRWLockShared(&g_lock);
+    plat_mutex_lock_shared(&g_lock);
     int on = G.dev == c->device && G.bc;
-    ReleaseSRWLockShared(&g_lock);
+    plat_mutex_unlock_shared(&g_lock);
     return on;
 }
 
@@ -428,15 +425,15 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     (void)src_size;
     VkCtx *c = vk_ctx();
     if (!c || !vk_astc_gpu() || bw < 4 || bh < 4 || bw > 12 || bh > 12) return 0;
-    AcquireSRWLockShared(&g_lock);
+    plat_mutex_lock_shared(&g_lock);
     VkPipeline pipe = G.dev == c->device ? G.pipe : VK_NULL_HANDLE, bc_pipe = G.dev == c->device ? G.bc_pipe : VK_NULL_HANDLE;
-    ReleaseSRWLockShared(&g_lock);
+    plat_mutex_unlock_shared(&g_lock);
     if (!pipe || (bc && !bc_pipe)) return 0;
     if (bc) {
         readback = VK_NULL_HANDLE;
         for (int i = 0; i < n; i++)   // a BC copy starts on a block corner; a WriteTexels region of a 5x5 or 6x6 footprint may not
             if ((rg[i].offset.x & 3) || (rg[i].offset.y & 3)) {
-                if (InterlockedIncrement(&n_unaligned) <= 16)
+                if (__atomic_add_fetch(&n_unaligned, 1, __ATOMIC_SEQ_CST) <= 16)
                     rt_log("vk: ASTC to BC3: region at %d,%d is not on a 4x4 block corner: texture left as it was",
                            rg[i].offset.x, rg[i].offset.y);
                 return 0;
@@ -465,16 +462,16 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     VkBuffer sb;
     VmaAllocation sa;
     if (vmaCreateBuffer(c->vma, &bi, &aci, &sb, &sa, NULL) != VK_SUCCESS) {
-        if (InterlockedIncrement(&n_fail) <= 16)
+        if (__atomic_add_fetch(&n_fail, 1, __ATOMIC_SEQ_CST) <= 16)
             rt_log("vk: ASTC scratch buffer of %llu bytes failed: texture left undecoded",
                    (unsigned long long)(cap_in + cap_out));
         return 0;
     }
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_lock(&g_lock);
     int need_tab = !G.tab_uploaded;
     G.tab_uploaded = 1;
     VkBuffer tab = G.tab;
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
     if (need_tab) {   // first use on this device: the tables go up in this batch, before the dispatch
         VkBuffer tb;
         uint8_t *p = vk_staging(TAB_SIZE, &tb, NULL);
@@ -485,7 +482,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
     int timed = 0, whole = -1;
     uint32_t id = 0;
     uint8_t fp = (uint8_t)(bw * 13 + bh);
-    AcquireSRWLockExclusive(&t_lock);
+    plat_mutex_lock(&t_lock);
     time_init(c);
     if (t_on > 0 && t_pool) {
         time_poll_locked(c);
@@ -496,7 +493,7 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
         if (whole < 0) t_call[id % TA].complete = 0;
     }
     VkQueryPool tpool = t_pool;
-    ReleaseSRWLockExclusive(&t_lock);
+    plat_mutex_unlock(&t_lock);
     if (whole >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)whole);
     VkDescriptorBufferInfo dbi[3] = {{sb, 0, cap_in}, {sb, cap_in, cap_out}, {tab, 0, TAB_SIZE}};
     VkWriteDescriptorSet w[3];
@@ -527,10 +524,10 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
         int slot = -1;   // the timestamps bracket this chunk's dispatches: the first waits for the blocks copy
         if (timed) {
-            AcquireSRWLockExclusive(&t_lock);
+            plat_mutex_lock(&t_lock);
             slot = time_slot(id, fp, out / 4, 0);
             if (slot < 0) t_call[id % TA].complete = 0;
-            ReleaseSRWLockExclusive(&t_lock);
+            plat_mutex_unlock(&t_lock);
         }
         if (slot >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)slot);
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
@@ -591,9 +588,9 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
                     VK_ACCESS_2_HOST_READ_BIT);
     if (whole >= 0) vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, tpool, 2 * (uint32_t)whole + 1);
     if (timed) {
-        AcquireSRWLockExclusive(&t_lock);
+        plat_mutex_lock(&t_lock);
         t_call[id % TA].chunks = (uint32_t)chunks;
-        ReleaseSRWLockExclusive(&t_lock);
+        plat_mutex_unlock(&t_lock);
     }
     if ((n_dispatch + (uint64_t)n) / 1024 != n_dispatch / 1024 || !n_dispatch) {
         rt_log("vk: ASTC: %llu regions, %.1f M texels decoded on the GPU so far",
@@ -609,11 +606,11 @@ int vk_astc_record(VkCommandBuffer cb, VkBuffer src, VkDeviceSize src_size, cons
 void vk_astc_release(void) {
     VkCtx *c = vk_ctx();
     vk_astc_time_summary();
-    AcquireSRWLockExclusive(&t_lock);
+    plat_mutex_lock(&t_lock);
     if (c && t_pool && t_dev == c->device) vkDestroyQueryPool(c->device, t_pool, NULL);
     t_pool = VK_NULL_HANDLE, t_dev = VK_NULL_HANDLE;
-    ReleaseSRWLockExclusive(&t_lock);
-    AcquireSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&t_lock);
+    plat_mutex_lock(&g_lock);
     if (c && G.dev == c->device) {
         if (G.pipe) vkDestroyPipeline(c->device, G.pipe, NULL);
         if (G.bc_pipe) vkDestroyPipeline(c->device, G.bc_pipe, NULL);
@@ -625,7 +622,7 @@ void vk_astc_release(void) {
     G.dev = VK_NULL_HANDLE;
     G.mode = -1;
     G.failed = 0;
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_mutex_unlock(&g_lock);
 }
 
 void vk_astc_stats(uint64_t *dispatches, uint64_t *texels) {

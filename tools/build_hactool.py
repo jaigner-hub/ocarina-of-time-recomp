@@ -55,7 +55,7 @@ def fetch(src):
 
 def make(src):
     """Runs make in src; returns the completed process."""
-    jobs = f'-j{os.cpu_count() or 4}'
+    jobs = f'-j{min(4, os.cpu_count() or 4)}'   # at most 4 jobs: the portable laptop has 15 GB of RAM
     if WINDOWS:
         env = dict(os.environ, MSYSTEM='UCRT64', CHERE_INVOKING='1')
         return subprocess.run([str(MSYS_BASH), '-lc', f'make {jobs}'], cwd=src, env=env,

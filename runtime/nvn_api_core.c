@@ -9,7 +9,6 @@
 //
 // Objects are stored in place in the NVN object memory the game provides (nvn_obj.h); every argument is read from the
 // AAPCS64 registers (host.h arg_x / arg_p) and every result returned with ret_x.
-#include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +19,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
+#include "platform/platform.h"
 
 #define DEV_MAGIC MAGIC('D', 'E', 'V', 0)
 #define QUEUE_MAGIC MAGIC('Q', 'U', 'E', 'U')
@@ -85,7 +85,7 @@ __attribute__((weak)) int gfx_replay_async(void) { return 0; }
 __attribute__((weak)) uint64_t gfx_replayed_submits(void) { return nvn_submit_count(); }
 
 // ---------- pools: GPU window (section 3.1) and the address index
-static SRWLOCK pool_lock = SRWLOCK_INIT;   // guards gva and index
+static PlatMutex pool_lock = PLAT_MUTEX_INIT;   // guards gva and index
 typedef struct { uint64_t lo, hi; } Span;
 enum { GVA_MAX = 1024 };
 static Span gva[GVA_MAX];   // ranges handed out in the GPU window, sorted by lo
@@ -94,7 +94,7 @@ static pidx pool_index;
 
 // First fit in [RT_GPU_VA_BASE, +RT_GPU_VA_SIZE); size is a multiple of 64 KiB, so every range stays 64 KiB aligned.
 static uint64_t gva_alloc(uint64_t size) {
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     uint64_t at = RT_GPU_VA_BASE, r = 0;
     int i = 0;
     for (; i < ngva && gva[i].lo - at < size; i++) at = gva[i].hi;
@@ -104,42 +104,42 @@ static uint64_t gva_alloc(uint64_t size) {
         ngva++;
         r = at;
     }
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
     return r;
 }
 
 static void gva_free(uint64_t lo) {
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     for (int i = 0; i < ngva; i++)
         if (gva[i].lo == lo) {
             memmove(gva + i, gva + i + 1, (size_t)(ngva - i - 1) * sizeof *gva);
             ngva--;
             break;
         }
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
 }
 
 static void index_add(const pool_t *o) {
     uintptr_t lo = (uintptr_t)o->mem;
     pidx_ent e = {.lo = lo, .hi = lo + o->size, .base = lo, .gpu = lo, .key = o};
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     pidx_remove(&pool_index, o, NULL);   // a pool object initialized again without Finalize
     int ok = pidx_insert(&pool_index, &e);
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
     if (!ok) rt_fatal("nvn: out of memory for the pool index");
 }
 
 static void index_del(const pool_t *o) {
-    AcquireSRWLockExclusive(&pool_lock);
+    plat_mutex_lock(&pool_lock);
     pidx_remove(&pool_index, o, NULL);
-    ReleaseSRWLockExclusive(&pool_lock);
+    plat_mutex_unlock(&pool_lock);
 }
 
 const pool_t *nvn_pool_find(uint64_t addr, uint64_t len) {
-    AcquireSRWLockShared(&pool_lock);
+    plat_mutex_lock_shared(&pool_lock);
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, len);
     const pool_t *p = e ? e->key : NULL;
-    ReleaseSRWLockShared(&pool_lock);
+    plat_mutex_unlock_shared(&pool_lock);
     return p;
 }
 
@@ -336,7 +336,7 @@ NVN_API(nvnMemoryPoolFinalize) {
     if (pool_gpu_visible(o)) index_del(o);
     gfx_backend()->pool_fini(o);
     if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
-    if (o->host) mem_shadow_release((uintptr_t)o->host), o->host = NULL;
+    if (o->host) mem_shadow_release((uintptr_t)o->host, o->size), o->host = NULL;
     o->mem = o->game_mem;
     o->span = 0;
     o->magic = 0;
@@ -452,8 +452,8 @@ NVN_API(nvnMemoryPoolMapVirtual) {
     for (int i = 0; i < n; i++) {
         const pool_t *src = (const pool_t *)(const void *)r[i].physical_pool;
         if (!src || shadow_source(src)) { shadow_map(v, &r[i]); nshadow++; continue; }
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 3)
+        static volatile int32_t said;
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 3)
             rt_log("nvn: MapVirtual: a physical pool mapped into a virtual pool, which has shadow storage here: not supported, "
                    "the pages stay zero");
     }
@@ -543,8 +543,8 @@ NVN_API(nvnSyncWait) {
     const sync_t *s = arg_p(c, 0);
     uint64_t timeout = arg_x(c, 1);
     if (!s->fenced) {
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 3) rt_log("nvn: SyncWait on a sync never fenced: timeout at once");
+        static volatile int32_t said;
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 3) rt_log("nvn: SyncWait on a sync never fenced: timeout at once");
         ret_x(c, NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
         return;
     }
@@ -559,8 +559,8 @@ NVN_API(nvnSyncWait) {
     else if (timeout) {
         // A blocking wait that gave up: on hardware such waits (the game's frame throttle, say) end in time; here a
         // GPU far behind (pipeline builds) lets the CPU run on, which this game's timer-query pool does not survive.
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 20)
+        static volatile int32_t said;
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 20)
             rt_log("nvn: SyncWait(%p, fence %llu, timeout %llu ns) timed out: fence_done %llu, newest submit %llu",
                    (const void *)s, (unsigned long long)s->fence, (unsigned long long)timeout,
                    (unsigned long long)b->fence_done(), (unsigned long long)nvn_fence_last());
@@ -691,13 +691,13 @@ NVN_API(nvnQueueSubmitCommands) {
     uint64_t f;
     if (gfx_replay_async()) {
         // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
-        static SRWLOCK submit_lock = SRWLOCK_INIT;
+        static PlatMutex submit_lock = PLAT_MUTEX_INIT;
         uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
         if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
-        AcquireSRWLockExclusive(&submit_lock);
+        plat_mutex_lock(&submit_lock);
         nvn_submit_prepare_async(h, hs, n);
         f = gfx_backend()->submit(hs, n);
-        ReleaseSRWLockExclusive(&submit_lock);
+        plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
         nvn_submit_prepare(h, n);
@@ -723,7 +723,7 @@ static void obs_release_read(Cpu *c) {
     uint64_t e = __atomic_load_n(&lod_entered, __ATOMIC_SEQ_CST);
     if (!e) return;
     NVN_BLOCKING();
-    for (int i = 0; i < 200 && __atomic_load_n(&lod_issued, __ATOMIC_SEQ_CST) < e; i++) Sleep(1);
+    for (int i = 0; i < 200 && __atomic_load_n(&lod_issued, __ATOMIC_SEQ_CST) < e; i++) plat_sleep_ns(1 * 1000000ull);
     uint64_t f = __atomic_load_n(&lod_fence[e % LOD_RING], __ATOMIC_RELAXED);
     if (gfx_backend()->fence_done() < f) gfx_backend()->fence_wait(f, 200000000ull);
 }

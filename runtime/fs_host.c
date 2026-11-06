@@ -1,6 +1,7 @@
 // From metroid-prime-4-recomp runtime/fs_host.c @ 586e91e1b6f38c9e512e39f2d47a046fdf273cf0 (MIT, Copyright (c) 2026 Jeff Aigner), copied with mp4 renamed to oot.
 // From fe3h-pc-recomp runtime/fs_host.c @ 47ef99126793dbd13e4a475feb910a13ef6639b8 (MIT, Copyright (c) 2026 Jeff Aigner), copied with fe3h renamed to mp4; adds GetSaveDataSize with this game's declared save sizes; the fs trace logs every open and entry-type query; path arguments take '\\' as a separator and drop "." components, as Horizon does and this game writes; file and directory handles are multiples of 8; RomFS directories go to romfs.c.
 // From totk-pc-recomp runtime/fs_host.c @ c944f9f94520874f2a669add30dd08d29ee9f7b5 (MIT, Copyright (c) 2026 Valiantsin Dzerakh), renamed to fe3h; adds the older SDK calls GetDirectoryEntryCount, CommitSaveData, EnsureSaveData and SetAllocator (FE3H, SDK 6.5.0); logs failed opens with FE3H_TRACE=fs and the backtrace of an invalid close.
+// From totk-pc-recomp runtime/fs_host.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (MIT, Copyright (c) 2026 Valiantsin Dzerakh): the portable form, on the plat_fs_* and plat_file_* calls of platform/platform.h. The directory listing is taken at open, the save commit and its recovery are the same, and the Windows calls this file made before moved to platform/win32.c; the Linux calls are in platform/linux.c.
 // Adapted from MacNativeGames games/totk/runtime/fs_host.c @ b75be8cf (MIT, Copyright (c) 2026 MacNativeGames
 // contributors); the probe follows MacNativeGames' romfs.c runtime_fs_probe and fs_host.c runtime_save_probe.
 // nn::fs host implementation of the functions main imports. RomFS paths and
@@ -18,11 +19,15 @@
 // The save mount is journaled as on Horizon: changes go to a working copy and become the committed save atomically at
 // Commit; a crash or an Unmount before Commit leaves the previous committed save. Commit returns at once and the copy
 // runs on a background thread (section "save transactions"); fs_save_flush lets the exit paths wait for it. Paths are
-// UTF-8 and go to the W APIs as UTF-16.
-#include <windows.h>
+// UTF-8; platform.h's plat_fs_* and plat_file_* calls convert them for the OS.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include "fs.h"
 #include "host.h"
@@ -40,20 +45,29 @@
 enum { M_FREE, M_SAVE, M_TEMP, M_CACHE, M_SAVE_RO };   // M_SAVE: the working copy; M_SAVE_RO: the committed save
 
 typedef struct { int kind; char name[32]; char root[1024]; } Mount;
-typedef struct { HANDLE h; int mode, save; } File;   // h NULL = free; save: on a save-data mount
-typedef struct { HANDLE find; WIN32_FIND_DATAW next; int has_next, mode; wchar_t *pattern; } Dir;   // find NULL = free; pattern: <dir>/* for GetDirectoryEntryCount
+typedef struct { PlatFile *h; int mode, save; } File;   // h NULL = free; save: on a save-data mount
+typedef struct { char *name; int kind; uint64_t size; } Listed;
+typedef struct { Listed *e; int n, next, mode, used; } Dir;   // the entries at open; used 0 = free
 
 static Mount mounts[NMOUNTS];
 static File files[NFILES];
 static Dir dirs[NDIRS];
-static SRWLOCK lock = SRWLOCK_INIT;
+static PlatMutex lock = PLAT_MUTEX_INIT;   // a reader-writer lock: taken shared for lookups
 static char profile[1024], save_root[1100], work_root[1100];
-static volatile LONG storage_ready;
+static volatile int32_t storage_ready;
+
+// The atomics of the shared state below (GCC and Clang builtins, sequentially consistent).
+#define ATOMIC_LOAD(p) __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#define ATOMIC_STORE(p, v) __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
+#define ATOMIC_XCHG(p, v) __atomic_exchange_n((p), (v), __ATOMIC_SEQ_CST)
+#define ATOMIC_ADD(p, v) __atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST)
 
 static void need(int c, const char *m) {
     if (!c) rt_fatal("fs: %s", m);
 }
 
+#ifdef _WIN32
+// romfs.c still calls the W APIs of Windows directly: the UTF-16 copy of a UTF-8 path. Fatal on invalid UTF-8.
 wchar_t *fs_wide(const char *s) {
     int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
     if (n <= 0) rt_fatal("fs: path is not valid UTF-8");
@@ -62,36 +76,65 @@ wchar_t *fs_wide(const char *s) {
     MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n);
     return w;
 }
+#endif
 
-static DWORD attributes(const char *path) {
-    wchar_t *w = fs_wide(path);
-    DWORD a = GetFileAttributesW(w);
-    free(w);
-    return a;
+// ---- directory listings: every entry but "." and "..", taken whole before the caller changes the directory.
+typedef struct { Listed *e; int n, cap; } Listing;
+
+static int listing_add(const char *name, int kind, uint64_t size, void *ctx) {
+    Listing *l = ctx;
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 16;
+        l->e = realloc(l->e, (size_t)l->cap * sizeof *l->e);
+        need(l->e != NULL, "directory listing");
+    }
+    l->e[l->n].name = strdup(name);
+    need(l->e[l->n].name != NULL, "directory listing");
+    l->e[l->n].kind = kind, l->e[l->n].size = size;
+    l->n++;
+    return 1;
+}
+
+static int list_dir(const char *dir, Listing *l) {
+    *l = (Listing){0};
+    return plat_fs_list(dir, listing_add, l);
+}
+
+static void listing_free(Listed *e, int n) {
+    for (int i = 0; i < n; i++) free(e[i].name);
+    free(e);
+}
+
+// dir/name in a malloc'd string.
+static char *join(const char *dir, const char *name) {
+    size_t n = strlen(dir), k = strlen(name);
+    char *p = malloc(n + k + 2);
+    need(p != NULL, "path allocation");
+    memcpy(p, dir, n);
+    p[n] = '/';
+    memcpy(p + n + 1, name, k + 1);
+    return p;
 }
 
 // Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet
 // (TotK writes a slot's files back to back and then commits; between the files nothing is open for a moment).
-static volatile LONG save_writers, save_dirty;
-static volatile LONG64 save_changed_ns;
+static volatile int32_t save_writers, save_dirty;
+static volatile int64_t save_changed_ns;
 static void save_wait_commit(void);
 static void save_touched(void) {
     save_wait_commit();   // every change to save data comes here first: none lands in a commit's snapshot
-    InterlockedExchange64(&save_changed_ns, (LONG64)plat_now_ns());
-    InterlockedExchange(&save_dirty, 1);
+    ATOMIC_STORE(&save_changed_ns, (int64_t)plat_now_ns());
+    ATOMIC_STORE(&save_dirty, 1);
 }
 int fs_save_busy(void) {
-    if (InterlockedCompareExchange(&save_writers, 0, 0) > 0) return 1;
-    return InterlockedCompareExchange(&save_dirty, 0, 0) &&
-           plat_now_ns() - (uint64_t)InterlockedCompareExchange64(&save_changed_ns, 0, 0) < 3000000000ull;
+    if (ATOMIC_LOAD(&save_writers) > 0) return 1;
+    return ATOMIC_LOAD(&save_dirty) && plat_now_ns() - (uint64_t)ATOMIC_LOAD(&save_changed_ns) < 3000000000ull;
 }
 
 // ---- host directories
 static int make_dir(const char *p) {
-    wchar_t *w = fs_wide(p);
-    int ok = CreateDirectoryW(w, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
-    free(w);
-    return ok;
+    int r = plat_fs_mkdir(p);
+    return r == PLAT_FS_OK || r == PLAT_FS_EXISTS;
 }
 
 // p and every missing parent.
@@ -105,51 +148,28 @@ static void make_dirs(const char *p) {
             make_dir(buf);
             *q = c;
         }
-    if (!make_dir(buf)) rt_fatal("fs: cannot create directory %s (error %lu)", buf, GetLastError());
+    if (!make_dir(buf)) rt_fatal("fs: cannot create directory %s (error %d)", buf, plat_fs_os_error());
 }
 
-// Remove a directory tree; a reparse point is removed as a link, never followed. 0 also when nothing is there.
-static int remove_tree_w(const wchar_t *path) {
-    DWORD a = GetFileAttributesW(path);
-    if (a == INVALID_FILE_ATTRIBUTES)
-        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? 0 : -1;
-    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) {
-        if (a & FILE_ATTRIBUTE_READONLY) SetFileAttributesW(path, a & ~FILE_ATTRIBUTE_READONLY);
-        return DeleteFileW(path) ? 0 : -1;
-    }
-    int bad = 0;
-    if (!(a & FILE_ATTRIBUTE_REPARSE_POINT)) {
-        size_t n = wcslen(path);
-        wchar_t *pattern = malloc((n + 3) * sizeof *pattern);
-        need(pattern != NULL, "path allocation");
-        memcpy(pattern, path, n * sizeof *pattern);
-        memcpy(pattern + n, L"\\*", 3 * sizeof *pattern);
-        WIN32_FIND_DATAW fd;
-        HANDLE f = FindFirstFileW(pattern, &fd);
-        free(pattern);
-        if (f != INVALID_HANDLE_VALUE) {
-            do {
-                if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-                size_t k = wcslen(fd.cFileName);
-                wchar_t *child = malloc((n + k + 2) * sizeof *child);
-                need(child != NULL, "path allocation");
-                memcpy(child, path, n * sizeof *child);
-                child[n] = L'\\';
-                memcpy(child + n + 1, fd.cFileName, (k + 1) * sizeof *child);
-                bad |= remove_tree_w(child);
-                free(child);
-            } while (FindNextFileW(f, &fd));
-            FindClose(f);
-        }
-    }
-    return bad | (RemoveDirectoryW(path) ? 0 : -1);
-}
-
+// Remove a tree; a link is removed as a link, never followed. 0 also when nothing is there.
 static int remove_tree(const char *path) {
-    wchar_t *w = fs_wide(path);
-    int r = remove_tree_w(w);
-    free(w);
-    return r;
+    int kind = plat_fs_kind(path);
+    if (kind == PLAT_FS_MISSING) return 0;
+    if (kind == PLAT_FS_FILE) {
+        plat_file_set_readonly(path, 0);   // Windows refuses to delete a read-only file
+        return plat_fs_unlink(path) ? -1 : 0;
+    }
+    if (kind == PLAT_FS_LINK) return plat_fs_unlink(path) && plat_fs_rmdir(path) ? -1 : 0;
+    Listing l;
+    int bad = 0;
+    list_dir(path, &l);   // a directory that cannot be listed is removed as far as it goes, as before
+    for (int i = 0; i < l.n; i++) {
+        char *c = join(path, l.e[i].name);
+        bad |= remove_tree(c);
+        free(c);
+    }
+    listing_free(l.e, l.n);
+    return bad | (plat_fs_rmdir(path) ? -1 : 0);
 }
 
 // ---- save transactions
@@ -161,13 +181,13 @@ static int remove_tree(const char *path) {
 //   <profile>/save-tx/new/         Commit's staging copy of the working copy
 //   <profile>/save-tx/old/         the committed save a Commit replaced, on its way to save-backup
 //
-// Commit: (1) copy work to new and flush every file (FlushFileBuffers) and directory, a file equal to the committed
-// one as a hard link to it; (2) rename save/<uid> to old;
+// Commit: (1) copy work to new and flush every file and directory, a file equal to the committed one as a hard link
+// to it; (2) rename save/<uid> to old;
 // (3) rename new to save/<uid>, the commit point; (4) move old to save-backup/<UTC time> and keep the newest three.
-// Both renames are MoveFileExW with MOVEFILE_WRITE_THROUGH. The game's Commit returns 0 once steps (1) to (4) are
-// queued; a thread runs them (95-135 ms on the game thread before, in the 1.4.3 fight save) while every change to the
-// working copy waits in save_touched, and Unmount and the next Commit wait too. A crash in that time loses this Commit
-// only, and a failed one is logged instead of returned. save/<uid> is renamed away only after new is complete
+// Both renames are durable (the platform layer flushes the directories). The game's Commit returns 0 once steps (1) to
+// (4) are queued; a thread runs them (95-135 ms on the game thread before, in the 1.4.3 fight save) while every change
+// to the working copy waits in save_touched, and Unmount and the next Commit wait too. A crash in that time loses this
+// Commit only, and a failed one is logged instead of returned. save/<uid> is renamed away only after new is complete
 // on disk, so the recovery rule at start (save_recover) is:
 //   save/<uid> present   it is the committed save (the old one if the crash came before (3), the new one after);
 //                        new, if present, is an unfinished copy and is deleted (rollback);
@@ -177,10 +197,9 @@ static int remove_tree(const char *path) {
 #define SAVE_BACKUPS 3
 #define COPY_CHUNK (1u << 20)
 
-static char tx_root[1100], backup_root[1100];
-static wchar_t *w_save, *w_work, *w_new, *w_old, *w_backup;
-static SRWLOCK tx_lock = SRWLOCK_INIT;   // taken before lock, never inside it
-static int save_mounts;                  // M_SAVE mounts: the working copy exists while this is above 0
+static char tx_root[1100], backup_root[1100], new_root[1100], old_root[1100];
+static PlatMutex tx_lock = PLAT_MUTEX_INIT;   // taken before lock, never inside it
+static int save_mounts;                       // M_SAVE mounts: the working copy exists while this is above 0
 
 // Probe hook: Commit stops at its tx_crash_at-th step (from 1) and leaves the disk as a process killed there would.
 static int tx_crash_at, tx_step, tx_dead;
@@ -189,168 +208,144 @@ static int crashed(void) {
     return tx_dead;
 }
 
-static wchar_t *wjoin(const wchar_t *a, const wchar_t *b) {
-    size_t n = wcslen(a), k = wcslen(b);
-    wchar_t *w = malloc((n + k + 2) * sizeof *w);
-    need(w != NULL, "path allocation");
-    memcpy(w, a, n * sizeof *w);
-    w[n] = L'\\';
-    memcpy(w + n + 1, b, (k + 1) * sizeof *w);
-    return w;
-}
-
-static int exists_w(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
+static int exists(const char *p) { return plat_fs_kind(p) != PLAT_FS_MISSING; }
 
 // Rename a directory, durably; retried for up to 2 s while another process (a virus scanner, the indexer) holds a
 // file in it. 0 on success.
-static int move_dir_w(const wchar_t *from, const wchar_t *to) {
+static int move_dir(const char *from, const char *to) {
     for (int i = 0; i < 40; i++) {
-        if (MoveFileExW(from, to, MOVEFILE_WRITE_THROUGH)) return 0;
-        DWORD e = GetLastError();
-        if (e != ERROR_ACCESS_DENIED && e != ERROR_SHARING_VIOLATION) return -1;
-        Sleep(50);
+        int r = plat_fs_rename(from, to, 1);
+        if (!r) return 0;
+        if (r != PLAT_FS_BUSY) return -1;
+        plat_sleep_ns(50000000ull);
     }
     return -1;
 }
 
 // Copy one file; the source may be open for writing (a save file the game has not closed). 0 on success.
-static int copy_file_w(const wchar_t *src, const wchar_t *dst, int durable, uint64_t *bytes) {
-    HANDLE in = CreateFileW(src, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    if (in == INVALID_HANDLE_VALUE) return -1;
-    HANDLE out = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (out == INVALID_HANDLE_VALUE) {
-        CloseHandle(in);
+static int copy_file(const char *src, const char *dst, int durable, uint64_t *bytes) {
+    PlatFile *in = plat_fs_open(src, 0, NULL);
+    if (!in) return -1;
+    PlatFile *out = plat_fs_create(dst, NULL);
+    if (!out) {
+        plat_file_close(in);
         return -1;
     }
     uint8_t *buf = malloc(COPY_CHUNK);
     need(buf != NULL, "copy buffer");
     int ok = 1;
-    for (;;) {
-        DWORD got = 0, put = 0;
-        if (!ReadFile(in, buf, COPY_CHUNK, &got, NULL)) ok = 0;
-        if (!ok || !got) break;
-        if (!WriteFile(out, buf, got, &put, NULL) || put != got) ok = 0;
-        if (!ok) break;
-        *bytes += got;
+    for (uint64_t off = 0; ok;) {
+        int64_t got = plat_file_pread(in, buf, COPY_CHUNK, off);
+        if (got <= 0) {
+            ok = got == 0;
+            break;
+        }
+        for (int64_t done = 0; done < got && ok;) {
+            int64_t put = plat_file_pwrite(out, buf + done, (uint32_t)(got - done), off + done);
+            if (put <= 0) ok = 0;
+            else done += put;
+        }
+        off += (uint64_t)got;
+        if (ok) *bytes += (uint64_t)got;
     }
-    if (ok && durable) ok = FlushFileBuffers(out);
+    if (ok && durable) ok = plat_file_fsync(out);
     free(buf);
-    CloseHandle(in);
-    CloseHandle(out);
+    plat_file_close(in);
+    plat_file_close(out);
     return ok ? 0 : -1;
 }
 
 // Whether files a and b hold the same bytes; 0 when either cannot be read.
-static int same_file_w(const wchar_t *a, const wchar_t *b) {
-    HANDLE h[2];
-    const wchar_t *p[2] = {a, b};
-    for (int i = 0; i < 2; i++)
-        h[i] = CreateFileW(p[i], GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                           OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
-    LARGE_INTEGER na, nb;
-    int same = h[0] != INVALID_HANDLE_VALUE && h[1] != INVALID_HANDLE_VALUE && GetFileSizeEx(h[0], &na) &&
-               GetFileSizeEx(h[1], &nb) && na.QuadPart == nb.QuadPart;
+static int same_file(const char *a, const char *b) {
+    PlatFile *h[2] = {plat_fs_open(a, 0, NULL), plat_fs_open(b, 0, NULL)};
+    PlatFileId ia, ib;
+    int same = h[0] && h[1] && plat_file_id(h[0], &ia) && plat_file_id(h[1], &ib) && ia.size == ib.size;
     uint8_t *buf = same ? malloc(2 * (size_t)COPY_CHUNK) : NULL;
     if (same) need(buf != NULL, "compare buffer");
-    while (same) {
-        DWORD ga = 0, gb = 0;
-        if (!ReadFile(h[0], buf, COPY_CHUNK, &ga, NULL) || !ReadFile(h[1], buf + COPY_CHUNK, COPY_CHUNK, &gb, NULL) ||
-            ga != gb || memcmp(buf, buf + COPY_CHUNK, ga))
-            same = 0;
-        else if (!ga)
-            break;
+    for (uint64_t off = 0; same;) {
+        int64_t ga = plat_file_pread(h[0], buf, COPY_CHUNK, off);
+        int64_t gb = plat_file_pread(h[1], buf + COPY_CHUNK, COPY_CHUNK, off);
+        if (ga < 0 || ga != gb || memcmp(buf, buf + COPY_CHUNK, (size_t)ga)) same = 0;
+        else if (!ga) break;
+        else off += (uint64_t)ga;
     }
     free(buf);
     for (int i = 0; i < 2; i++)
-        if (h[i] != INVALID_HANDLE_VALUE) CloseHandle(h[i]);
+        if (h[i]) plat_file_close(h[i]);
     return same;
 }
 
-// Copy the tree src to dst, which must not exist; reparse points are skipped. durable: every file is flushed, and
-// every directory as far as the file system allows (NTFS journals the entries either way). base (or NULL): the
-// committed save; a file whose bytes equal base's file at the same path becomes a hard link to it instead of a copy
-// (*nlinked), as committed files are never written in place (the game writes the working copy). A save commit then
-// writes the 3-4 files of the slot the game saved instead of all 82 (300-380 ms of flushes on the game thread).
-// 0 on success.
-static int copy_tree_w(const wchar_t *src, const wchar_t *dst, const wchar_t *base, int durable, int *nfiles,
-                       int *nlinked, uint64_t *bytes) {
-    if (!CreateDirectoryW(dst, NULL)) return -1;
-    wchar_t *pattern = wjoin(src, L"*");
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW(pattern, &fd);
-    free(pattern);
-    if (f == INVALID_HANDLE_VALUE) return -1;
+// Copy the tree src to dst, which must not exist; links are skipped. durable: every file is flushed, and every
+// directory as far as the file system allows. base (or NULL): the committed save; a file whose bytes equal base's file
+// at the same path becomes a hard link to it instead of a copy (*nlinked), as committed files are never written in
+// place (the game writes the working copy). A save commit then writes the 3-4 files of the slot the game saved instead
+// of all 82 (300-380 ms of flushes on the game thread). 0 on success.
+static int copy_tree(const char *src, const char *dst, const char *base, int durable, int *nfiles, int *nlinked,
+                     uint64_t *bytes) {
+    if (plat_fs_mkdir(dst)) return -1;
+    Listing l;
+    if (list_dir(src, &l)) {
+        listing_free(l.e, l.n);
+        return -1;
+    }
     int bad = 0;
-    do {
-        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") ||
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
-            continue;
-        wchar_t *s = wjoin(src, fd.cFileName), *d = wjoin(dst, fd.cFileName);
-        wchar_t *b = base ? wjoin(base, fd.cFileName) : NULL;
-        if (b && !exists_w(b)) free(b), b = NULL;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) bad = copy_tree_w(s, d, b, durable, nfiles, nlinked, bytes);
+    for (int i = 0; i < l.n && !bad; i++) {
+        const Listed *e = &l.e[i];
+        if (e->kind == PLAT_FS_LINK) continue;
+        char *s = join(src, e->name), *d = join(dst, e->name);
+        char *b = base ? join(base, e->name) : NULL;
+        if (b && !exists(b)) free(b), b = NULL;
+        if (e->kind == PLAT_FS_DIR) bad = copy_tree(s, d, b, durable, nfiles, nlinked, bytes);
         else {
-            if (b && same_file_w(s, b) && CreateHardLinkW(d, b, NULL)) bad = 0, ++*nlinked;
-            else bad = copy_file_w(s, d, durable, bytes);
+            if (b && same_file(s, b) && !plat_fs_link(b, d)) bad = 0, ++*nlinked;
+            else bad = copy_file(s, d, durable, bytes);
             *nfiles += !bad;
             if (!bad && durable && crashed()) bad = -1;
         }
         free(s);
         free(d);
         free(b);
-    } while (!bad && FindNextFileW(f, &fd));
-    FindClose(f);
-    if (!bad && durable) {
-        HANDLE h = CreateFileW(dst, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                               OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        if (h != INVALID_HANDLE_VALUE) {
-            FlushFileBuffers(h);
-            CloseHandle(h);
-        }
     }
+    listing_free(l.e, l.n);
+    if (!bad && durable) plat_fs_sync_dir(dst);
     return bad;
 }
 
-static int name_cmp(const void *a, const void *b) { return wcscmp(a, b); }
+static int name_cmp(const void *a, const void *b) { return strcmp(a, b); }
 
 // Move old to save-backup/<UTC time> and delete all backups but the newest SAVE_BACKUPS.
 static void rotate_backup(void) {
-    if (!exists_w(w_old)) return;
-    SYSTEMTIME t;
-    GetSystemTime(&t);
-    wchar_t name[48], *dst = NULL;
-    for (int k = 0; !dst || exists_w(dst); k++) {
+    if (!exists(old_root)) return;
+    struct tm t;
+    unsigned ms = 0;
+    plat_utc_now(&t, &ms);
+    char name[48], *dst = NULL;
+    for (int k = 0; !dst || exists(dst); k++) {
         free(dst);
-        int n = swprintf(name, 48, L"%04u%02u%02u-%02u%02u%02u-%03u", (unsigned)t.wYear, (unsigned)t.wMonth,
-                         (unsigned)t.wDay, (unsigned)t.wHour, (unsigned)t.wMinute, (unsigned)t.wSecond,
-                         (unsigned)t.wMilliseconds);
-        if (k) swprintf(name + n, 48 - (size_t)n, L"-%d", k);
-        dst = wjoin(w_backup, name);
+        int n = snprintf(name, 48, "%04d%02d%02d-%02d%02d%02d-%03u", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+                         t.tm_min, t.tm_sec, ms);
+        if (k) snprintf(name + n, 48 - (size_t)n, "-%d", k);
+        dst = join(backup_root, name);
     }
-    if (move_dir_w(w_old, dst)) {
-        rt_log("fs: cannot move the replaced save to save-backup (error %lu); deleted", GetLastError());
-        remove_tree_w(w_old);
+    if (move_dir(old_root, dst)) {
+        rt_log("fs: cannot move the replaced save to save-backup (error %d); deleted", plat_fs_os_error());
+        remove_tree(old_root);
     }
     free(dst);
-    static wchar_t names[64][48];
+    static char names[64][48];
     int n = 0;
-    wchar_t *pattern = wjoin(w_backup, L"*");
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW(pattern, &fd);
-    free(pattern);
-    if (f != INVALID_HANDLE_VALUE) {
-        do
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] >= L'0' &&
-                fd.cFileName[0] <= L'9' && wcslen(fd.cFileName) < 48 && n < 64)
-                wcscpy(names[n++], fd.cFileName);
-        while (FindNextFileW(f, &fd));
-        FindClose(f);
+    Listing l;
+    list_dir(backup_root, &l);
+    for (int i = 0; i < l.n; i++) {
+        const Listed *e = &l.e[i];
+        if (e->kind == PLAT_FS_DIR && e->name[0] >= '0' && e->name[0] <= '9' && strlen(e->name) < 48 && n < 64)
+            snprintf(names[n++], 48, "%s", e->name);
     }
+    listing_free(l.e, l.n);
     qsort(names, (size_t)n, sizeof *names, name_cmp);
     for (int i = 0; i + SAVE_BACKUPS < n; i++) {
-        wchar_t *p = wjoin(w_backup, names[i]);
-        remove_tree_w(p);
+        char *p = join(backup_root, names[i]);
+        remove_tree(p);
         free(p);
     }
 }
@@ -358,23 +353,25 @@ static void rotate_backup(void) {
 // Startup: finish or roll back an interrupted Commit and drop uncommitted changes (the rule above).
 static void save_recover(void) {
     const char *did = "nothing to recover";
-    int has_save = exists_w(w_save);
-    if (!has_save && exists_w(w_new)) {
-        if (move_dir_w(w_new, w_save)) rt_fatal("fs: cannot complete an interrupted save commit (error %lu)",
-                                                GetLastError());
+    int has_save = exists(save_root);
+    if (!has_save && exists(new_root)) {
+        if (move_dir(new_root, save_root)) rt_fatal("fs: cannot complete an interrupted save commit (error %d)",
+                                                    plat_fs_os_error());
         did = "completed an interrupted commit";
-    } else if (!has_save && exists_w(w_old)) {
-        if (move_dir_w(w_old, w_save)) rt_fatal("fs: cannot roll back an interrupted save commit (error %lu)",
-                                                GetLastError());
+    } else if (!has_save && exists(old_root)) {
+        if (move_dir(old_root, save_root)) rt_fatal("fs: cannot roll back an interrupted save commit (error %d)",
+                                                    plat_fs_os_error());
         did = "rolled back an interrupted commit";
-    } else if (exists_w(w_new)) {
-        if (remove_tree_w(w_new)) rt_fatal("fs: cannot delete an unfinished save commit (error %lu)", GetLastError());
+    } else if (exists(new_root)) {
+        if (remove_tree(new_root)) rt_fatal("fs: cannot delete an unfinished save commit (error %d)",
+                                            plat_fs_os_error());
         did = "rolled back an unfinished commit";
-    } else if (exists_w(w_old))
+    } else if (exists(old_root))
         did = "moved the save an interrupted commit replaced to save-backup";
     rotate_backup();
-    if (exists_w(w_work)) {
-        if (remove_tree_w(w_work)) rt_fatal("fs: cannot delete the old save working copy (error %lu)", GetLastError());
+    if (exists(work_root)) {
+        if (remove_tree(work_root)) rt_fatal("fs: cannot delete the old save working copy (error %d)",
+                                             plat_fs_os_error());
         if (!strcmp(did, "nothing to recover"))
             did = "deleted the last run's working copy (changes after its last Commit)";
     }
@@ -385,15 +382,15 @@ static void save_recover(void) {
 static void work_create(void) {
     int n = 0, linked = 0;
     uint64_t bytes = 0;
-    if (remove_tree_w(w_work) || copy_tree_w(w_save, w_work, NULL, 0, &n, &linked, &bytes))
-        rt_fatal("fs: cannot make the save working copy (error %lu)", GetLastError());
+    if (remove_tree(work_root) || copy_tree(save_root, work_root, NULL, 0, &n, &linked, &bytes))
+        rt_fatal("fs: cannot make the save working copy (error %d)", plat_fs_os_error());
     rt_log("host save working copy: %d files, %.1f MiB", n, bytes / 1048576.0);
 }
 
 // The last save unmount: changes no Commit took are dropped.
 static void work_discard(void) {
-    if (InterlockedExchange(&save_dirty, 0)) rt_log("fs: save unmounted without Commit; changes discarded");
-    if (remove_tree_w(w_work)) rt_log("fs: save working copy not fully deleted (a file still open?)");
+    if (ATOMIC_XCHG(&save_dirty, 0)) rt_log("fs: save unmounted without Commit; changes discarded");
+    if (remove_tree(work_root)) rt_log("fs: save working copy not fully deleted (a file still open?)");
 }
 
 // Commit of the save mount, tx_lock held. Steps (1) to (4) above; every failure before (3) leaves the committed save.
@@ -402,91 +399,89 @@ static uint32_t save_commit_locked(void) {
     int nfiles = 0, linked = 0;
     tx_step = tx_dead = 0;
     rotate_backup();   // an old left by a failed (4)
-    const wchar_t *base = exists_w(w_save) ? w_save : NULL;
-    if (remove_tree_w(w_new) || copy_tree_w(w_work, w_new, base, 1, &nfiles, &linked, &bytes)) {
+    const char *base = exists(save_root) ? save_root : NULL;
+    if (remove_tree(new_root) || copy_tree(work_root, new_root, base, 1, &nfiles, &linked, &bytes)) {
         if (tx_dead) return FS_R_INVALID_ARGUMENT;
-        rt_log("fs: save commit: copying the working copy failed (error %lu); committed save unchanged",
-               GetLastError());
-        remove_tree_w(w_new);
+        rt_log("fs: save commit: copying the working copy failed (error %d); committed save unchanged",
+               plat_fs_os_error());
+        remove_tree(new_root);
         return FS_R_INVALID_ARGUMENT;
     }
     if (crashed()) return FS_R_INVALID_ARGUMENT;
-    if (exists_w(w_save) && move_dir_w(w_save, w_old)) {
-        rt_log("fs: save commit: cannot move the committed save (error %lu); committed save unchanged",
-               GetLastError());
-        remove_tree_w(w_new);
+    if (exists(save_root) && move_dir(save_root, old_root)) {
+        rt_log("fs: save commit: cannot move the committed save (error %d); committed save unchanged",
+               plat_fs_os_error());
+        remove_tree(new_root);
         return FS_R_INVALID_ARGUMENT;
     }
     if (crashed()) return FS_R_INVALID_ARGUMENT;
-    if (move_dir_w(w_new, w_save)) {
-        DWORD e = GetLastError();
-        if (move_dir_w(w_old, w_save))
-            rt_fatal("fs: save commit: cannot swap in the new save (error %lu); the next start completes it", e);
-        rt_log("fs: save commit: cannot swap in the new save (error %lu); committed save unchanged", e);
-        remove_tree_w(w_new);
+    if (move_dir(new_root, save_root)) {
+        int e = plat_fs_os_error();
+        if (move_dir(old_root, save_root))
+            rt_fatal("fs: save commit: cannot swap in the new save (error %d); the next start completes it", e);
+        rt_log("fs: save commit: cannot swap in the new save (error %d); committed save unchanged", e);
+        remove_tree(new_root);
         return FS_R_INVALID_ARGUMENT;
     }
     if (crashed()) return FS_R_INVALID_ARGUMENT;
     rotate_backup();
-    InterlockedExchange(&save_dirty, 0);
+    ATOMIC_STORE(&save_dirty, 0);
     rt_log("fs commit save: %d files, %d changed (%.1f MiB written), %d unchanged linked, in %.0f ms", nfiles,
            nfiles - linked, bytes / 1048576.0, linked, (plat_now_ns() - t0) / 1e6);
     return 0;
 }
 
 // The background commit: commit_pending from the game's Commit until the thread has run save_commit_locked.
-static SRWLOCK pend_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE pend_cv = CONDITION_VARIABLE_INIT;
-static volatile LONG commit_pending;
+static PlatMutex pend_lock = PLAT_MUTEX_INIT;
+static PlatCond pend_cv = PLAT_COND_INIT;
+static volatile int32_t commit_pending;
 
 static void save_wait_commit(void) {
-    if (!InterlockedCompareExchange(&commit_pending, 0, 0)) return;
-    AcquireSRWLockExclusive(&pend_lock);
-    while (commit_pending) SleepConditionVariableSRW(&pend_cv, &pend_lock, INFINITE, 0);
-    ReleaseSRWLockExclusive(&pend_lock);
+    if (!ATOMIC_LOAD(&commit_pending)) return;
+    plat_mutex_lock(&pend_lock);
+    while (ATOMIC_LOAD(&commit_pending)) plat_cond_wait(&pend_cv, &pend_lock);
+    plat_mutex_unlock(&pend_lock);
 }
 
 void fs_save_flush(void) { save_wait_commit(); }
 
 static uint32_t commit_run(void) {
-    AcquireSRWLockExclusive(&tx_lock);
+    plat_mutex_lock(&tx_lock);
     uint32_t r = save_commit_locked();
-    InterlockedDecrement(&save_writers);
-    ReleaseSRWLockExclusive(&tx_lock);
-    AcquireSRWLockExclusive(&pend_lock);
-    commit_pending = 0;
-    ReleaseSRWLockExclusive(&pend_lock);
-    WakeAllConditionVariable(&pend_cv);
+    ATOMIC_ADD(&save_writers, -1);
+    plat_mutex_unlock(&tx_lock);
+    plat_mutex_lock(&pend_lock);
+    ATOMIC_STORE(&commit_pending, 0);
+    plat_mutex_unlock(&pend_lock);
+    plat_cond_broadcast(&pend_cv);
     return r;
 }
 
-static DWORD WINAPI commit_main(void *arg) {
+static void commit_main(void *arg) {
     (void)arg;
     commit_run();
-    return 0;
 }
 
 static uint32_t save_commit(void) {
     save_wait_commit();   // the previous Commit
     static int quiet;
-    if (!InterlockedCompareExchange(&save_dirty, 0, 0)) {
+    if (!ATOMIC_LOAD(&save_dirty)) {
         if (!quiet++) rt_log("fs commit save: nothing changed (logged once)");
         return 0;
     }
-    InterlockedIncrement(&save_writers);   // fs_save_busy until the thread is done
-    InterlockedExchange(&commit_pending, 1);
-    HANDLE t = CreateThread(NULL, 0, commit_main, NULL, 0, NULL);
+    ATOMIC_ADD(&save_writers, 1);   // fs_save_busy until the thread is done
+    ATOMIC_STORE(&commit_pending, 1);
+    PlatThread *t = plat_thread_new(commit_main, NULL, "fs-commit");
     if (t) {
-        CloseHandle(t);
+        plat_thread_detach(t);
         return 0;
     }
-    rt_log("fs: cannot start the save commit thread (error %lu); committing on the game thread", GetLastError());
+    rt_log("fs: cannot start the save commit thread (error %d); committing on the game thread", plat_fs_os_error());
     return commit_run();
 }
 
 // ---- storage roots
-static BOOL CALLBACK storage_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
-    (void)once, (void)param, (void)ctx;
+static void storage_init(void) {
     if (!*profile)
         need(snprintf(profile, sizeof profile, "%s", rt_config()->profile) < (int)sizeof profile, "profile path");
     uint64_t uid[2];
@@ -502,13 +497,8 @@ static BOOL CALLBACK storage_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     snprintf(backup_root, sizeof backup_root, "%s/save-backup", profile);
     make_dirs(tx_root);
     make_dirs(backup_root);
-    w_save = fs_wide(save_root);
-    w_work = fs_wide(work_root);
-    snprintf(p, sizeof p, "%s/new", tx_root);
-    w_new = fs_wide(p);
-    snprintf(p, sizeof p, "%s/old", tx_root);
-    w_old = fs_wide(p);
-    w_backup = fs_wide(backup_root);
+    snprintf(new_root, sizeof new_root, "%s/new", tx_root);
+    snprintf(old_root, sizeof old_root, "%s/old", tx_root);
     save_recover();   // before save_root is created: an absent save_root means a commit to complete
     make_dirs(save_root);
     snprintf(p, sizeof p, "%s/temp", profile);
@@ -516,18 +506,25 @@ static BOOL CALLBACK storage_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
     make_dirs(p);
     snprintf(p, sizeof p, "%s/cache", profile);
     make_dirs(p);
-    InterlockedExchange(&storage_ready, 1);
+    ATOMIC_STORE(&storage_ready, 1);
     rt_log("host save storage: %s", save_root);
-    return TRUE;
 }
 
+// Runs storage_init once; a second caller waits for the first to finish.
+static PlatMutex storage_mutex = PLAT_MUTEX_INIT;
+static int storage_once;   // under storage_mutex
+
 static void ready(void) {
-    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
-    InitOnceExecuteOnce(&once, storage_init, NULL, NULL);
+    plat_mutex_lock(&storage_mutex);
+    if (!storage_once) {
+        storage_init();
+        storage_once = 1;
+    }
+    plat_mutex_unlock(&storage_mutex);
 }
 
 void fs_host_set_profile(const char *dir) {
-    if (InterlockedCompareExchange(&storage_ready, 0, 0)) rt_fatal("fs_host_set_profile after the first storage use");
+    if (ATOMIC_LOAD(&storage_ready)) rt_fatal("fs_host_set_profile after the first storage use");
     need(dir && snprintf(profile, sizeof profile, "%s", dir) < (int)sizeof profile, "profile path");
 }
 
@@ -537,11 +534,11 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     char as_path[40];
     snprintf(as_path, sizeof as_path, "%s:", name);
     if (romfs_owns(as_path)) return FS_R_ALREADY_EXISTS;   // the RomFS mount's name
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     int slot = -1;
     for (int i = 0; i < NMOUNTS; i++) {
         if (mounts[i].kind && !strcmp(mounts[i].name, name)) {
-            ReleaseSRWLockExclusive(&lock);
+            plat_mutex_unlock(&lock);
             return FS_R_ALREADY_EXISTS;
         }
         if (!mounts[i].kind && slot < 0) slot = i;
@@ -550,7 +547,7 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     mounts[slot].kind = kind;
     strcpy(mounts[slot].name, name);
     snprintf(mounts[slot].root, sizeof mounts[slot].root, "%s", root);
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     rt_log("fs mount %s: -> %s", name, root);
     return 0;
 }
@@ -573,13 +570,13 @@ static uint32_t host_path_kind(const char *path, char *out, size_t cap, int *kin
     size_t n = (size_t)(colon - path);
     char root[1024];
     int k = M_FREE;
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     for (int i = 0; i < NMOUNTS; i++)
         if (mounts[i].kind && strlen(mounts[i].name) == n && !strncmp(mounts[i].name, path, n)) {
             strcpy(root, mounts[i].root);
             k = mounts[i].kind;
         }
-    ReleaseSRWLockShared(&lock);
+    plat_mutex_unlock_shared(&lock);
     if (k == M_FREE) return FS_R_PATH_NOT_FOUND;
     if (kind) *kind = k;
     const char *rest = colon + 1;
@@ -607,11 +604,13 @@ static uint32_t save_change_path(const char *path, char *out, size_t cap) {
     return r;
 }
 
-static uint32_t win_result(DWORD e) {
+// The guest's result for a failed plat_fs_* call. Only the three reasons the SDK names are told apart; BUSY and the
+// rest are invalid arguments, as they were for the Win32 error codes.
+static uint32_t fs_result(int e) {
     switch (e) {
-    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_DIRECTORY: return FS_R_PATH_NOT_FOUND;
-    case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: return FS_R_ALREADY_EXISTS;
-    case ERROR_DIR_NOT_EMPTY: return FS_R_NOT_EMPTY;
+    case PLAT_FS_NOT_FOUND: return FS_R_PATH_NOT_FOUND;
+    case PLAT_FS_EXISTS: return FS_R_ALREADY_EXISTS;
+    case PLAT_FS_NOT_EMPTY: return FS_R_NOT_EMPTY;
     default: return FS_R_INVALID_ARGUMENT;
     }
 }
@@ -626,12 +625,12 @@ static int my_uid(const uint64_t *uid) {
 static uint32_t mount_save(const char *name, const uint64_t *uid) {
     ready();
     if (!my_uid(uid)) return FS_R_TARGET_NOT_FOUND;
-    AcquireSRWLockExclusive(&tx_lock);
+    plat_mutex_lock(&tx_lock);
     if (!save_mounts) work_create();
     uint32_t r = mount_add(name, M_SAVE, work_root);
     if (!r) save_mounts++;
-    else if (!save_mounts) remove_tree_w(w_work);
-    ReleaseSRWLockExclusive(&tx_lock);
+    else if (!save_mounts) remove_tree(work_root);
+    plat_mutex_unlock(&tx_lock);
     return r;
 }
 
@@ -660,10 +659,8 @@ static uint32_t create_cache(int index, int64_t size, int64_t journal) {
     if (index < 0 || size < 0 || journal < 0) return FS_R_INVALID_ARGUMENT;
     char p[PATH_CAP];
     cache_dir(index, p, sizeof p);
-    wchar_t *w = fs_wide(p);
-    uint32_t r = CreateDirectoryW(w, NULL) ? 0 : win_result(GetLastError());
-    free(w);
-    return r;
+    int r = plat_fs_mkdir(p);
+    return r ? fs_result(r) : 0;
 }
 
 static uint32_t delete_cache(int index) {
@@ -677,8 +674,7 @@ static uint32_t mount_cache(const char *name, int index) {
     ready();
     char p[PATH_CAP];
     cache_dir(index, p, sizeof p);
-    DWORD a = attributes(p);
-    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return FS_R_TARGET_NOT_FOUND;
+    if (plat_fs_kind(p) != PLAT_FS_DIR) return FS_R_TARGET_NOT_FOUND;
     return mount_add(name, M_CACHE, p);
 }
 
@@ -692,20 +688,16 @@ static uint32_t open_cache_list(uint64_t *out) {
     CacheList *l = calloc(1, sizeof *l);
     need(l != NULL, "cache list allocation");
     char p[PATH_CAP];
-    snprintf(p, sizeof p, "%s/cache/*", profile);
-    wchar_t *w = fs_wide(p);
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW(w, &fd);
-    free(w);
-    if (f != INVALID_HANDLE_VALUE) {
-        do {
-            wchar_t *end;
-            long v = wcstol(fd.cFileName, &end, 10);
-            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && *fd.cFileName && !*end && v >= 0 && l->count < 64)
-                l->list[l->count++] = (int)v;
-        } while (FindNextFileW(f, &fd));
-        FindClose(f);
+    snprintf(p, sizeof p, "%s/cache", profile);
+    Listing ls;
+    list_dir(p, &ls);
+    for (int i = 0; i < ls.n; i++) {
+        char *end;
+        long v = strtol(ls.e[i].name, &end, 10);
+        if (ls.e[i].kind == PLAT_FS_DIR && *ls.e[i].name && !*end && v >= 0 && l->count < 64)
+            l->list[l->count++] = (int)v;
     }
+    listing_free(ls.e, ls.n);
     *out = (uint64_t)(uintptr_t)l;
     return 0;
 }
@@ -726,20 +718,20 @@ static void close_cache_list(uint64_t h) { free((void *)(uintptr_t)h); }
 
 static void unmount(const char *name) {
     save_wait_commit();   // else the working copy could go before a Commit queued just now has copied it
-    AcquireSRWLockExclusive(&tx_lock);
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&tx_lock);
+    plat_mutex_lock(&lock);
     for (int i = 0; i < NMOUNTS; i++)
         if (name && mounts[i].kind && !strcmp(mounts[i].name, name)) {
             int save = mounts[i].kind == M_SAVE;
             mounts[i].kind = M_FREE;
-            ReleaseSRWLockExclusive(&lock);
+            plat_mutex_unlock(&lock);
             if (save && !--save_mounts) work_discard();
-            ReleaseSRWLockExclusive(&tx_lock);
+            plat_mutex_unlock(&tx_lock);
             rt_log("fs unmount %s", name);
             return;
         }
-    ReleaseSRWLockExclusive(&lock);
-    ReleaseSRWLockExclusive(&tx_lock);
+    plat_mutex_unlock(&lock);
+    plat_mutex_unlock(&tx_lock);
     size_t n = name ? strlen(name) : 0;
     char probe[40];
     if (!n || n >= 32 || (snprintf(probe, sizeof probe, "%s:", name), !romfs_owns(probe)))
@@ -748,41 +740,39 @@ static void unmount(const char *name) {
 
 static uint32_t commit(const char *name) {
     int found = 0, save = 0;
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     for (int i = 0; i < NMOUNTS; i++)
         if (name && mounts[i].kind && !strcmp(mounts[i].name, name)) found = 1, save = mounts[i].kind == M_SAVE;
-    ReleaseSRWLockShared(&lock);
+    plat_mutex_unlock_shared(&lock);
     if (!found) return FS_R_PATH_NOT_FOUND;
     if (save) return save_commit();   // durability comes from the staging copy, not the working copy's handles
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     for (int i = 0; i < NFILES; i++)
-        if (files[i].h && (files[i].mode & FS_OPEN_WRITE)) FlushFileBuffers(files[i].h);
-    ReleaseSRWLockShared(&lock);
+        if (files[i].h && (files[i].mode & FS_OPEN_WRITE)) plat_file_fsync(files[i].h);
+    plat_mutex_unlock_shared(&lock);
     return 0;
 }
 
 // ---- files
-static File *file_of(uint64_t h, HANDLE *fh, int *mode) {
+static File *file_of(uint64_t h, PlatFile **fh, int *mode) {
     if (h < FILE_BASE || h >= FILE_BASE + NFILES * 8 || ((h - FILE_BASE) & 7)) return NULL;   // multiples of 8, as romfs.c
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     File *f = &files[(h - FILE_BASE) / 8];
-    HANDLE v = f->h;
+    PlatFile *v = f->h;
     if (fh) *fh = f->h;
     if (mode) *mode = f->mode;
-    ReleaseSRWLockShared(&lock);
+    plat_mutex_unlock_shared(&lock);
     return v ? f : NULL;
 }
 
-// Positional I/O on a synchronous handle: ReadFile/WriteFile with an OVERLAPPED offset.
-static int64_t host_read_at(HANDLE f, void *buf, uint32_t n, uint64_t off) {
-    OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
-    DWORD got = 0;
+// Positional read through the platform layer. A read-only page in the buffer is a failure here, as it was in the
+// Win32 code, and is logged: a frozen region missed its thaw.
+static int64_t host_read_at(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
     mem_thaw((uintptr_t)buf, n);   // the kernel's write would fail on a frozen page instead of faulting
-    if (!ReadFile(f, buf, n, &got, &ov)) {
-        DWORD e = GetLastError();
-        if (e == ERROR_NOACCESS)   // a read-only page in the buffer: a frozen region missed its thaw
-            rt_log("fs: read of %u bytes into %p refused: the buffer is not writable", n, buf);
-        return e == ERROR_HANDLE_EOF ? 0 : -1;
+    int64_t got = plat_file_pread(f, buf, n, off);
+    if (got == -2) {
+        rt_log("fs: read of %u bytes into %p refused: the buffer is not writable", n, buf);
+        return -1;
     }
     return got;
 }
@@ -795,36 +785,31 @@ static uint32_t open_file(uint64_t *out, const char *path, int mode) {
     int kind = M_FREE;
     uint32_t r = host_path_kind(path, p, sizeof p, &kind);
     if (r) return r;
-    DWORD a = attributes(p);
-    if (a == INVALID_FILE_ATTRIBUTES || (a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
-        return FS_R_PATH_NOT_FOUND;
+    if (plat_fs_kind(p) != PLAT_FS_FILE) return FS_R_PATH_NOT_FOUND;   // missing, a directory or a link
     if (kind == M_SAVE_RO && (mode & FS_OPEN_WRITE)) return FS_R_UNSUPPORTED_OPEN;
     int save_writer = kind == M_SAVE && (mode & FS_OPEN_WRITE);
-    DWORD access = (mode & FS_OPEN_READ ? GENERIC_READ : 0) | (mode & FS_OPEN_WRITE ? GENERIC_WRITE : 0);
-    wchar_t *w = fs_wide(p);
-    HANDLE f = CreateFileW(w, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                           FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    if (f == INVALID_HANDLE_VALUE) return win_result(GetLastError());
-    AcquireSRWLockExclusive(&lock);
+    int err = 0;
+    PlatFile *f = plat_fs_open(p, (mode & FS_OPEN_WRITE) != 0, &err);
+    if (!f) return fs_result(err);
+    plat_mutex_lock(&lock);
     for (int i = 0; i < NFILES; i++)
         if (!files[i].h) {
             files[i] = (File){f, mode, save_writer};
             *out = FILE_BASE + (uint64_t)i * 8;
-            ReleaseSRWLockExclusive(&lock);
+            plat_mutex_unlock(&lock);
             if (save_writer) {
-                InterlockedIncrement(&save_writers);
+                ATOMIC_ADD(&save_writers, 1);
                 save_touched();
             }
             return 0;
         }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     rt_fatal("fs: host file handle table full (%d)", NFILES);
 }
 
 static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size) {
     if (romfs_handle(h)) return romfs_read(out, h, offset, buffer, size);
-    HANDLE f;
+    PlatFile *f;
     int mode;
     if (!out || offset < 0 || (!buffer && size) || !file_of(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_READ)) return FS_R_OPEN_MODE;
@@ -832,7 +817,7 @@ static uint32_t read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     while (done < size) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
         int64_t n = host_read_at(f, (uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
-        if (n < 0) rt_fatal("fs: host save read failure (error %lu)", GetLastError());
+        if (n < 0) rt_fatal("fs: host save read failure (error %d)", plat_fs_os_error());
         if (!n) break;
         done += (uint64_t)n;
     }
@@ -847,53 +832,50 @@ static uint32_t read_exact(uint64_t h, int64_t off, void *buf, uint64_t size) {
 }
 
 static uint32_t write_file(uint64_t h, int64_t offset, const void *buffer, uint64_t size, const int32_t *option) {
-    HANDLE f;
+    PlatFile *f;
     int mode;
     File *file = offset < 0 || (!buffer && size) ? NULL : file_of(h, &f, &mode);
     if (!file) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
-    LARGE_INTEGER sz;
-    if (!GetFileSizeEx(f, &sz)) rt_fatal("fs: host save size (error %lu)", GetLastError());
-    if ((uint64_t)offset + size > (uint64_t)sz.QuadPart && !(mode & FS_OPEN_APPEND)) return FS_R_APPEND_REQUIRED;
+    PlatFileId id;
+    if (!plat_file_id(f, &id)) rt_fatal("fs: host save size (error %d)", plat_fs_os_error());
+    if ((uint64_t)offset + size > id.size && !(mode & FS_OPEN_APPEND)) return FS_R_APPEND_REQUIRED;
     if (file->save) save_touched();
     for (uint64_t done = 0; done < size;) {
         uint32_t chunk = size - done > 0x40000000 ? 0x40000000 : (uint32_t)(size - done);
-        uint64_t at = (uint64_t)offset + done;
-        OVERLAPPED ov = {.Offset = (DWORD)at, .OffsetHigh = (DWORD)(at >> 32)};
-        DWORD put = 0;
-        if (!WriteFile(f, (const uint8_t *)buffer + done, chunk, &put, &ov) || !put)
-            rt_fatal("fs: host save write failure (error %lu)", GetLastError());
-        done += put;
+        int64_t put = plat_file_pwrite(f, (const uint8_t *)buffer + done, chunk, (uint64_t)offset + done);
+        if (put <= 0) rt_fatal("fs: host save write failure (error %d)", plat_fs_os_error());
+        done += (uint64_t)put;
     }
-    if (option && (*option & 1)) FlushFileBuffers(f);   // WriteOptionFlag_Flush
+    if (option && (*option & 1)) plat_file_fsync(f);   // WriteOptionFlag_Flush
     return 0;
 }
 
 static uint32_t file_size(int64_t *out, uint64_t h) {
     if (romfs_handle(h)) return romfs_size(out, h);
-    HANDLE f;
-    LARGE_INTEGER sz;
-    if (!out || !file_of(h, &f, NULL) || !GetFileSizeEx(f, &sz)) return FS_R_INVALID_ARGUMENT;
-    *out = sz.QuadPart;
+    PlatFile *f;
+    PlatFileId id;
+    if (!out || !file_of(h, &f, NULL) || !plat_file_id(f, &id)) return FS_R_INVALID_ARGUMENT;
+    *out = (int64_t)id.size;
     return 0;
 }
 
 static uint32_t set_file_size(uint64_t h, int64_t size) {
-    HANDLE f;
+    PlatFile *f;
     int mode;
     File *file = size < 0 ? NULL : file_of(h, &f, &mode);
     if (!file) return FS_R_INVALID_ARGUMENT;
     if (!(mode & FS_OPEN_WRITE)) return FS_R_OPEN_MODE;
     if (file->save) save_touched();
-    FILE_END_OF_FILE_INFO eof = {.EndOfFile.QuadPart = size};
-    return SetFileInformationByHandle(f, FileEndOfFileInfo, &eof, sizeof eof) ? 0 : win_result(GetLastError());
+    int r = plat_file_set_size(f, (uint64_t)size);
+    return r ? fs_result(r) : 0;
 }
 
 static uint32_t flush_file(uint64_t h) {
-    HANDLE f;
+    PlatFile *f;
     int mode;
     if (!file_of(h, &f, &mode)) return FS_R_INVALID_ARGUMENT;
-    if (mode & FS_OPEN_WRITE) FlushFileBuffers(f);
+    if (mode & FS_OPEN_WRITE) plat_file_fsync(f);
     return 0;
 }
 
@@ -903,15 +885,15 @@ static void close_file(uint64_t h) {
         return;
     }
     if (!file_of(h, NULL, NULL)) rt_fatal("fs: close of invalid file handle %#llx", (unsigned long long)h);
-    AcquireSRWLockExclusive(&lock);
-    HANDLE f = files[(h - FILE_BASE) / 8].h;
+    plat_mutex_lock(&lock);
+    PlatFile *f = files[(h - FILE_BASE) / 8].h;
     int save = files[(h - FILE_BASE) / 8].save;
     files[(h - FILE_BASE) / 8] = (File){0};
-    ReleaseSRWLockExclusive(&lock);
-    CloseHandle(f);
+    plat_mutex_unlock(&lock);
+    plat_file_close(f);
     if (save) {
         save_touched();
-        InterlockedDecrement(&save_writers);
+        ATOMIC_ADD(&save_writers, -1);
     }
 }
 
@@ -920,25 +902,20 @@ static uint32_t create_file(const char *path, int64_t size) {
     uint32_t r = save_change_path(path, p, sizeof p);
     if (r) return r;
     if (size < 0) return FS_R_INVALID_ARGUMENT;
-    wchar_t *w = fs_wide(p);
-    HANDLE f = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    if (f == INVALID_HANDLE_VALUE) return win_result(GetLastError());
-    FILE_END_OF_FILE_INFO eof = {.EndOfFile.QuadPart = size};
-    int ok = !size || SetFileInformationByHandle(f, FileEndOfFileInfo, &eof, sizeof eof);
-    DWORD e = GetLastError();
-    CloseHandle(f);
-    return ok ? 0 : win_result(e);
+    int err = 0;
+    PlatFile *f = plat_fs_create(p, &err);
+    if (!f) return fs_result(err);
+    int e = size ? plat_file_set_size(f, (uint64_t)size) : 0;
+    plat_file_close(f);
+    return e ? fs_result(e) : 0;
 }
 
 static uint32_t delete_file(const char *path) {
     char p[PATH_CAP];
     uint32_t r = save_change_path(path, p, sizeof p);
     if (r) return r;
-    wchar_t *w = fs_wide(p);
-    r = DeleteFileW(w) ? 0 : win_result(GetLastError());
-    free(w);
-    return r;
+    int e = plat_fs_unlink(p);
+    return e ? fs_result(e) : 0;
 }
 
 static uint32_t rename_file(const char *from, const char *to) {
@@ -948,12 +925,9 @@ static uint32_t rename_file(const char *from, const char *to) {
     if (r) return r;
     size_t n = strcspn(from, ":");
     if (strcspn(to, ":") != n || strncmp(from, to, n)) return FS_R_INVALID_PATH;   // across mounts
-    if (attributes(b) != INVALID_FILE_ATTRIBUTES) return FS_R_ALREADY_EXISTS;
-    wchar_t *wa = fs_wide(a), *wb = fs_wide(b);
-    r = MoveFileExW(wa, wb, 0) ? 0 : win_result(GetLastError());
-    free(wa);
-    free(wb);
-    return r;
+    if (exists(b)) return FS_R_ALREADY_EXISTS;
+    int e = plat_fs_rename(a, b, 0);
+    return e ? fs_result(e) : 0;
 }
 
 static uint32_t entry_type(int *out, const char *path) {
@@ -962,9 +936,9 @@ static uint32_t entry_type(int *out, const char *path) {
     uint32_t r = host_path(path, p, sizeof p);
     if (r) return r;
     if (!out) return FS_R_INVALID_ARGUMENT;
-    DWORD a = attributes(p);
-    if (a == INVALID_FILE_ATTRIBUTES) return FS_R_PATH_NOT_FOUND;
-    *out = a & FILE_ATTRIBUTE_DIRECTORY ? FS_ENTRY_DIRECTORY : FS_ENTRY_FILE;
+    int k = plat_fs_kind(p);
+    if (k == PLAT_FS_MISSING) return FS_R_PATH_NOT_FOUND;
+    *out = k == PLAT_FS_DIR ? FS_ENTRY_DIRECTORY : FS_ENTRY_FILE;   // save data holds no links
     return 0;
 }
 
@@ -976,19 +950,16 @@ static uint32_t create_directory(const char *path) {
     char p[PATH_CAP];
     uint32_t r = save_change_path(path, p, sizeof p);
     if (r) return r;
-    wchar_t *w = fs_wide(p);
-    r = CreateDirectoryW(w, NULL) ? 0 : win_result(GetLastError());
-    free(w);
-    return r;
+    int e = plat_fs_mkdir(p);
+    return e ? fs_result(e) : 0;
 }
 
 static uint32_t delete_recursive(const char *path) {
     char p[PATH_CAP];
     uint32_t r = save_change_path(path, p, sizeof p);
     if (r) return r;
-    DWORD a = attributes(p);
-    if (a == INVALID_FILE_ATTRIBUTES) return FS_R_PATH_NOT_FOUND;
-    if (!(a & FILE_ATTRIBUTE_DIRECTORY)) return FS_R_PATH_NOT_FOUND;
+    int k = plat_fs_kind(p);
+    if (k == PLAT_FS_MISSING || k == PLAT_FS_FILE) return FS_R_PATH_NOT_FOUND;
     return remove_tree(p) ? FS_R_INVALID_ARGUMENT : 0;
 }
 
@@ -998,77 +969,64 @@ static uint32_t open_directory(uint64_t *out, const char *path, int mode) {
     uint32_t r = host_path(path, p, sizeof p);
     if (r) return r;
     if (!out || mode < 1 || mode > 3) return FS_R_INVALID_ARGUMENT;
-    DWORD a = attributes(p);
-    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) return FS_R_PATH_NOT_FOUND;
-    char pattern[PATH_CAP + 4];
-    snprintf(pattern, sizeof pattern, "%s/*", p);
-    wchar_t *w = fs_wide(pattern);
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW(w, &fd);
-    if (f == INVALID_HANDLE_VALUE) {
-        uint32_t e = win_result(GetLastError());
-        free(w);
-        return e;
+    if (plat_fs_kind(p) != PLAT_FS_DIR) return FS_R_PATH_NOT_FOUND;
+    Listing l;
+    int e = list_dir(p, &l);
+    if (e) {
+        listing_free(l.e, l.n);
+        return fs_result(e);
     }
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     for (int i = 0; i < NDIRS; i++)
-        if (!dirs[i].find) {
-            dirs[i] = (Dir){f, fd, 1, mode, w};
+        if (!dirs[i].used) {
+            dirs[i] = (Dir){l.e, l.n, 0, mode, 1};
             *out = DIR_BASE + (uint64_t)i * 8;
-            ReleaseSRWLockExclusive(&lock);
+            plat_mutex_unlock(&lock);
             return 0;
         }
-    ReleaseSRWLockExclusive(&lock);
-    free(w);
+    plat_mutex_unlock(&lock);
+    listing_free(l.e, l.n);
     rt_fatal("fs: host directory handle table full (%d)", NDIRS);
 }
 
 // The name filter read_directory applies: not . or .., at most 768 bytes of UTF-8, of the kinds mode asks for.
-static int dir_entry_listed(const WIN32_FIND_DATAW *e, int mode) {
-    if (!wcscmp(e->cFileName, L".") || !wcscmp(e->cFileName, L"..")) return 0;
-    int k = WideCharToMultiByte(CP_UTF8, 0, e->cFileName, -1, NULL, 0, NULL, NULL);
-    if (k <= 0 || k > 769) return 0;
-    return !!(mode & (e->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? 1 : 2));
+static int dir_entry_listed(const Listed *e, int mode) {
+    if (!strcmp(e->name, ".") || !strcmp(e->name, "..")) return 0;
+    if (strlen(e->name) > 768) return 0;
+    return !!(mode & (e->kind == PLAT_FS_DIR ? 1 : 2));
 }
 
-// nn::fs::GetDirectoryEntryCount: every entry read_directory would return from a fresh open, whatever the handle has
-// read so far (the SDK counts with a second directory session, so the read position does not move).
+// nn::fs::GetDirectoryEntryCount: every entry read_directory would return for this handle's directory, whatever the
+// handle has read so far (the SDK counts with a second directory session, so the read position does not move).
 static uint32_t directory_entry_count(int64_t *out, uint64_t h) {
     if (romfs_dir_handle(h)) return romfs_directory_entry_count(out, h);
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS * 8 || ((h - DIR_BASE) & 7) || !out) return FS_R_INVALID_ARGUMENT;
-    AcquireSRWLockShared(&lock);
-    Dir d = dirs[(h - DIR_BASE) / 8];
-    ReleaseSRWLockShared(&lock);
-    if (!d.find || !d.pattern) return FS_R_INVALID_ARGUMENT;
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW(d.pattern, &fd);
-    if (f == INVALID_HANDLE_VALUE) return win_result(GetLastError());
+    plat_mutex_lock_shared(&lock);
+    Dir *d = &dirs[(h - DIR_BASE) / 8];
+    int used = d->used;
     int64_t n = 0;
-    do n += dir_entry_listed(&fd, d.mode);
-    while (FindNextFileW(f, &fd));
-    FindClose(f);
+    if (used)
+        for (int i = 0; i < d->n; i++) n += dir_entry_listed(&d->e[i], d->mode);
+    plat_mutex_unlock_shared(&lock);
+    if (!used) return FS_R_INVALID_ARGUMENT;
     *out = n;
     return 0;
 }
 
 static uint32_t read_directory(int64_t *count, DirectoryEntry *out, uint64_t h, int64_t max) {
     if (romfs_dir_handle(h)) return romfs_read_directory(count, out, h, max);
-    if (h < DIR_BASE || h >= DIR_BASE + NDIRS * 8 || ((h - DIR_BASE) & 7) || !count || max < 0 || (!out && max)) return FS_R_INVALID_ARGUMENT;
+    if (h < DIR_BASE || h >= DIR_BASE + NDIRS * 8 || ((h - DIR_BASE) & 7) || !count || max < 0 || (!out && max))
+        return FS_R_INVALID_ARGUMENT;
     Dir *d = &dirs[(h - DIR_BASE) / 8];
-    if (!d->find) return FS_R_INVALID_ARGUMENT;
+    if (!d->used) return FS_R_INVALID_ARGUMENT;
     int64_t n = 0;
-    while (n < max) {
-        if (!d->has_next && !FindNextFileW(d->find, &d->next)) break;
-        d->has_next = 0;
-        const WIN32_FIND_DATAW *e = &d->next;
+    while (n < max && d->next < d->n) {
+        const Listed *e = &d->e[d->next++];
         if (!dir_entry_listed(e, d->mode)) continue;   // over 768 bytes: nn::fs cannot name it
-        char name[800];
-        int k = WideCharToMultiByte(CP_UTF8, 0, e->cFileName, -1, name, sizeof name, NULL, NULL);
-        int is_dir = !!(e->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
         memset(&out[n], 0, sizeof *out);
-        memcpy(out[n].name, name, (size_t)k);
-        out[n].type = is_dir ? FS_ENTRY_DIRECTORY : FS_ENTRY_FILE;
-        out[n].size = is_dir ? 0 : (int64_t)((uint64_t)e->nFileSizeHigh << 32 | e->nFileSizeLow);
+        memcpy(out[n].name, e->name, strlen(e->name) + 1);
+        out[n].type = e->kind == PLAT_FS_DIR ? FS_ENTRY_DIRECTORY : FS_ENTRY_FILE;
+        out[n].size = e->kind == PLAT_FS_DIR ? 0 : (int64_t)e->size;
         n++;
     }
     *count = n;
@@ -1080,15 +1038,14 @@ static void close_directory(uint64_t h) {
         romfs_close_directory(h);
         return;
     }
-    if (h < DIR_BASE || h >= DIR_BASE + NDIRS * 8 || ((h - DIR_BASE) & 7) || !dirs[(h - DIR_BASE) / 8].find)
+    if (h < DIR_BASE || h >= DIR_BASE + NDIRS * 8 || ((h - DIR_BASE) & 7) || !dirs[(h - DIR_BASE) / 8].used)
         rt_fatal("fs: close of invalid directory handle %#llx", (unsigned long long)h);
-    AcquireSRWLockExclusive(&lock);
-    HANDLE f = dirs[(h - DIR_BASE) / 8].find;
-    wchar_t *pattern = dirs[(h - DIR_BASE) / 8].pattern;
+    plat_mutex_lock(&lock);
+    Listed *e = dirs[(h - DIR_BASE) / 8].e;
+    int n = dirs[(h - DIR_BASE) / 8].n;
     dirs[(h - DIR_BASE) / 8] = (Dir){0};
-    ReleaseSRWLockExclusive(&lock);
-    FindClose(f);
-    free(pattern);
+    plat_mutex_unlock(&lock);
+    listing_free(e, n);
 }
 
 // ---- overrides: AAPCS64 thunks. FileHandle, DirectoryHandle, CacheStorageListHandle
@@ -1316,7 +1273,7 @@ static uint64_t fs_call(const char *sym, const uint64_t a[6]) {
 #define CALL(sym, ...) fs_call(sym, (const uint64_t[6]){__VA_ARGS__})
 #define RES(sym, ...) ((uint32_t)CALL(sym, __VA_ARGS__))
 
-static int64_t independent_read(HANDLE f, uint8_t *buf, uint64_t n, uint64_t off) {
+static int64_t independent_read(PlatFile *f, uint8_t *buf, uint64_t n, uint64_t off) {
     uint64_t done = 0;
     while (done < n) {
         int64_t r = host_read_at(f, buf + done, (uint32_t)(n - done), off + done);
@@ -1328,7 +1285,7 @@ static int64_t independent_read(HANDLE f, uint8_t *buf, uint64_t n, uint64_t off
 
 // Read [pos, pos+n) of the open RomFS handle h through one of the three ReadFile overloads, and compare it with an
 // independent read of romfs.bin at the index offset.
-static int compare_range(HANDLE image, uint64_t h, uint64_t offset, uint64_t pos, uint64_t n, int variant,
+static int compare_range(PlatFile *image, uint64_t h, uint64_t offset, uint64_t pos, uint64_t n, int variant,
                          uint8_t *a, uint8_t *b) {
     uint64_t got = ~0ull;
     uint32_t r;
@@ -1345,10 +1302,12 @@ static void probe_paths(void) {
     static const struct { const char *path, *want; } cases[] = {
         {"rom:/a/b.bin", "a/b.bin"}, {"rom://a/b.bin", "a/b.bin"}, {"rom:///a/b.bin", "a/b.bin"},
         {"rom:/a", "a"},             {"rom:/../main", NULL},       {"rom://../a", NULL},
-        {"rom:/a/../b", NULL},       {"rom:/a/./b", NULL},         {"rom:/a//b", NULL},
+        {"rom:/a/../b", NULL},       {"rom:/a/./b", NULL},         {"rom:/a//b", "a/b"},
         {"rom:/a\\b", NULL},         {"rom:/", NULL},              {"rom://", NULL},
         {"rom:a", NULL},             {"ro:/a", NULL},              {"romx:/a", NULL},
         {"rom:/.", NULL},            {"rom:/..", NULL},            {"ROM:/a", NULL},
+        {"rom://Voice/Resource//Stream/x.bwav", "Voice/Resource/Stream/x.bwav"}, {"rom:/a///b//c", "a/b/c"},
+        {"rom:/a//../b", NULL},      {"rom:/a//./b", NULL},
     };
     int bad = 0;
     for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
@@ -1375,10 +1334,8 @@ static uint64_t probe_romfs(void) {
     CHECK(RES(S_MOUNT_ROM, U("../x"), 0, 0) == FS_R_INVALID, "MountRom with a bad name");
     probe_paths();
 
-    wchar_t *w = fs_wide(romfs_image_path());
-    HANDLE image = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    if (image == INVALID_HANDLE_VALUE) rt_fatal("probe-fs: cannot open the RomFS image (error %lu)", GetLastError());
+    PlatFile *image = plat_file_open(romfs_image_path());
+    if (!image) rt_fatal("probe-fs: cannot open the RomFS image");
     uint8_t *a = malloc(HEAD_BYTES), *b = malloc(HEAD_BYTES);
     need(a && b, "probe buffers");
     uint64_t step = count / SAMPLES, bytes = 0, sampled = 0, deep = 0, high = 0, largest = 0, lsize = 0;
@@ -1476,16 +1433,14 @@ static uint64_t probe_romfs(void) {
                  RES(S_READ_FILE, U(&got), h, 0, U(a), n) == 0 && got == n;
             CALL(S_CLOSE_FILE, h);
         }
-        wchar_t *wf = fs_wide(file);
-        HANDLE of = CreateFileW(wf, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        free(wf);
-        ok = ok && of != INVALID_HANDLE_VALUE && independent_read(of, b, n, 0) == (int64_t)n && !memcmp(a, b, n);
-        if (of != INVALID_HANDLE_VALUE) CloseHandle(of);
+        PlatFile *of = plat_file_open(file);
+        ok = ok && of && independent_read(of, b, n, 0) == (int64_t)n && !memcmp(a, b, n);
+        if (of) plat_file_close(of);
         CHECK(ok, "overlay %zu (%s)", k, is_added ? "added" : "replacement");
         ovok += ok;
     }
     if (nov) printf("romfs: %zu of %zu overlay files served from their overlay\n", ovok, nov);
-    CloseHandle(image);
+    plat_file_close(image);
     free(a);
     free(b);
     return count;
@@ -1494,12 +1449,12 @@ static uint64_t probe_romfs(void) {
 // ---- save transactions: restarts, uncommitted and committed changes, a crash at every step of a Commit
 // The process dies here: the save mount goes without Unmount, and the next start runs save_recover and mounts again.
 static void probe_restart(const uint64_t *uid) {
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     for (int i = 0; i < NMOUNTS; i++)
         if (mounts[i].kind == M_SAVE) mounts[i].kind = M_FREE;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     save_mounts = tx_crash_at = tx_dead = 0;
-    InterlockedExchange(&save_dirty, 0);
+    ATOMIC_STORE(&save_dirty, 0);
     save_recover();
     CHECK(RES(S_MOUNT_SAVE, U("save"), U(uid)) == 0, "MountSaveData after a restart");
 }
@@ -1542,39 +1497,30 @@ static int tx_read(const char *path) {
 
 // The same, read from the committed save on disk.
 static int tx_read_committed(const char *name) {
-    wchar_t *n = fs_wide(name), *p = wjoin(w_save, n);
-    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(n);
+    char *p = join(save_root, name);
+    PlatFile *f = plat_fs_open(p, 0, NULL);
     free(p);
-    if (f == INVALID_HANDLE_VALUE) return -1;
+    if (!f) return -1;
     int ok = independent_read(f, tx_buf, TX_SIZE, 0) == TX_SIZE;
-    CloseHandle(f);
+    plat_file_close(f);
     return tx_byte(ok);
 }
 
 // Hard links of a file of the committed save on disk; 0 when absent.
 static int tx_links_committed(const char *name) {
-    wchar_t *n = fs_wide(name), *p = wjoin(w_save, n);
-    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(n);
+    char *p = join(save_root, name);
+    int links = plat_fs_links(p);
     free(p);
-    BY_HANDLE_FILE_INFORMATION fi;
-    int links = f != INVALID_HANDLE_VALUE && GetFileInformationByHandle(f, &fi) ? (int)fi.nNumberOfLinks : 0;
-    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     return links;
 }
 
-static int count_dirs(const wchar_t *dir) {
-    wchar_t *pattern = wjoin(dir, L"*");
-    WIN32_FIND_DATAW fd;
-    HANDLE f = FindFirstFileW(pattern, &fd);
-    free(pattern);
+// The entries of dir that are directories and not "." or "..".
+static int count_dirs(const char *dir) {
+    Listing l;
+    list_dir(dir, &l);
     int n = 0;
-    if (f != INVALID_HANDLE_VALUE) {
-        do n += (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != L'.';
-        while (FindNextFileW(f, &fd));
-        FindClose(f);
-    }
+    for (int i = 0; i < l.n; i++) n += l.e[i].kind == PLAT_FS_DIR && l.e[i].name[0] != '.';
+    listing_free(l.e, l.n);
     return n;
 }
 
@@ -1623,11 +1569,11 @@ static void probe_save_tx(const uint64_t *uid) {
         else mixed++;
         CHECK(ok && (va == vb) && (va == committed), "crash at commit step %d: tx_a %d, tx_b %d (old %d, new %d)", k,
               va, vb, committed, next);
-        CHECK(!exists_w(w_new) && !exists_w(w_old), "crash at commit step %d: staging left after recovery", k);
+        CHECK(!exists(new_root) && !exists(old_root), "crash at commit step %d: staging left after recovery", k);
     }
     CHECK(steps >= 4 && olds && news && !mixed, "crash points: %d (%d old, %d new, %d mixed)", steps, olds, news,
           mixed);
-    int backups = count_dirs(w_backup);
+    int backups = count_dirs(backup_root);
     CHECK(backups == SAVE_BACKUPS, "save-backup holds %d saves", backups);
 
     // a Commit writes the changed file and links the unchanged one to the committed save it replaces
@@ -1664,11 +1610,11 @@ static void probe_save_tx(const uint64_t *uid) {
 }
 
 static void probe_storage(void) {
-    wchar_t tmpw[MAX_PATH + 1];
-    char tmp[MAX_PATH * 3], dir[MAX_PATH * 3 + 64];
-    DWORD n = GetTempPathW(MAX_PATH + 1, tmpw);
-    need(n && WideCharToMultiByte(CP_UTF8, 0, tmpw, -1, tmp, sizeof tmp, NULL, NULL) > 0, "temporary directory");
-    snprintf(dir, sizeof dir, "%soot-probe-fs-%lu", tmp, GetCurrentProcessId());
+    char tmp[1024], dir[1200];
+    need(plat_temp_dir(tmp, sizeof tmp), "temporary directory");
+    uint32_t id = 0;
+    plat_random(&id, sizeof id);
+    snprintf(dir, sizeof dir, "%s/oot-probe-fs-%08x", tmp, id);
     remove_tree(dir);
     fs_host_set_profile(dir);
     uint64_t uid[2], other[2], h = 0, h2 = 0, d = 0, l = 0;
@@ -1753,13 +1699,11 @@ static void probe_storage(void) {
     char host[1200];
     snprintf(host, sizeof host, "%s/save/%016llx%016llx/probe.sav", dir, (unsigned long long)uid[1],
              (unsigned long long)uid[0]);
-    wchar_t *w = fs_wide(host);
-    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
+    PlatFile *f = plat_file_open(host);
     memset(back, 0, sizeof back);
-    CHECK(f != INVALID_HANDLE_VALUE && independent_read(f, back, sizeof back, 0) == sizeof back &&
-          !memcmp(back, data, sizeof data), "the save file on disk");
-    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    CHECK(f && independent_read(f, back, sizeof back, 0) == sizeof back && !memcmp(back, data, sizeof data),
+          "the save file on disk");
+    if (f) plat_file_close(f);
 
     // resize, rename, delete
     CHECK(RES(S_OPEN_FILE, U(&h), U("save:/probe.sav"), FS_OPEN_READ | FS_OPEN_WRITE) == 0 &&
@@ -1797,7 +1741,7 @@ static void probe_storage(void) {
     CHECK(RES(S_DELETE_CACHE, 3) == 0, "DeleteCacheStorage");
     CALL(S_UNMOUNT, U("save"));
 
-    int removed = !remove_tree(dir) && attributes(dir) == INVALID_FILE_ATTRIBUTES;
+    int removed = !remove_tree(dir) && plat_fs_kind(dir) == PLAT_FS_MISSING;
     CHECK(removed, "the temporary profile was not deleted");
     printf("storage: save create/write/commit/reopen, directories, rename/delete, temporary and cache storage in a "
            "temporary profile: %s; profile deleted: %s\n", failures ? "see FAIL lines" : "ok", removed ? "yes" : "no");
@@ -1811,7 +1755,7 @@ int probe_fs(void) {
         probe_addr[i] = hostfn_register(probe_symbols[i], fn);
     }
     printf("overrides: %d nn::fs overrides registered\n", NPROBE);
-    pcpu = _aligned_malloc(sizeof(Cpu), 64);
+    pcpu = plat_aligned_alloc(sizeof(Cpu), 64);
     need(pcpu != NULL, "probe Cpu");
     memset(pcpu, 0, sizeof *pcpu);
     uint8_t *stack = mem_kernel_alloc(0x10000, 16);
@@ -1825,7 +1769,7 @@ int probe_fs(void) {
     for (int r = 19; r < 30; r++) kept &= pcpu->x[r] == 0x1900u + r;
     CHECK(kept && pcpu->sp == (uint64_t)(uintptr_t)stack + 0x10000, "an override lost a callee-saved register");
     mem_kernel_free(stack, 0x10000);
-    _aligned_free(pcpu);
+    plat_aligned_free(pcpu);
     if (failures) {
         printf("probe-fs: FAILED (%d of %d checks)\n", failures, checks);
         return 1;

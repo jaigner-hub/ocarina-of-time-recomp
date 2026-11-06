@@ -9,6 +9,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "input.h"
 #include "input_map.h"
 #include "platform/platform.h"
@@ -38,8 +39,8 @@ int probe_cfg(void) {
         "no_such_setting = 1\r\n"
         "no equals sign\r\n"
         "last = no newline at the end";
-    _putenv_s("OOT_LOCALE", "");   // an empty variable is how _putenv_s spells "remove" on Windows
-    _putenv_s("OOT_FPS60", "");
+    plat_setenv("OOT_LOCALE", "");   // an empty variable is how _putenv_s spells "remove" on Windows
+    plat_setenv("OOT_FPS60", "");
     CHECK(plat_file_write(path, ini, sizeof ini - 1), "write the probe ini");
     CHECK(cfg_load(path) == 1, "load the probe ini");
     CHECK(EQ(cfg_get("OOT_FPS60"), "0"), "value read, whitespace trimmed, lower-case key");
@@ -51,9 +52,9 @@ int probe_cfg(void) {
     CHECK(cfg_get("OOT_CLOTH_REALTIME") == NULL, "absent key is NULL");
     CHECK(cfg_get("OOT_comment") == NULL, "comment is not a key");
     CHECK(EQ(cfg_get("OOT_NO_SUCH_SETTING"), "1"), "unknown key is still readable");
-    _putenv_s("OOT_FPS60", "1");
+    plat_setenv("OOT_FPS60", "1");
     CHECK(EQ(cfg_get("OOT_FPS60"), "1"), "environment overrides the file");
-    _putenv_s("OOT_FPS60", "");
+    plat_setenv("OOT_FPS60", "");
     CHECK(EQ(cfg_get("OOT_FPS60"), "0"), "file value returns when the variable is removed");
     plat_file_delete(path);
     CHECK(cfg_load(path) == 0, "missing file is not an error");
@@ -93,9 +94,9 @@ int probe_cfg(void) {
         "\r\n"
         "[audio]\r\n"
         "volume = 40\r\n";
-    _putenv_s("OOT_MOTION", "");
-    _putenv_s("OOT_VOLUME", "");
-    _putenv_s("OOT_RUMBLE_STRENGTH", "");
+    plat_setenv("OOT_MOTION", "");
+    plat_setenv("OOT_VOLUME", "");
+    plat_setenv("OOT_RUMBLE_STRENGTH", "");
     CHECK(plat_file_write(path, before, sizeof before - 1), "write the save ini");
     CHECK(cfg_load(path) == 1, "load the save ini");
     unsigned v0 = cfg_version();
@@ -120,11 +121,11 @@ int probe_cfg(void) {
           EQ(cfg_get("OOT_RUMBLE_STRENGTH"), "80") && EQ(cfg_get("OOT_VOLUME"), "40") &&
           EQ(cfg_get("OOT_ROMFS_MODS"), "C:\\mods"), "the saved file reads back");
     const char *held = cfg_get("OOT_VOLUME");
-    _putenv_s("OOT_VOLUME", "70");
+    plat_setenv("OOT_VOLUME", "70");
     cfg_set("OOT_VOLUME", "90");
     CHECK(cfg_from_env("OOT_VOLUME") && EQ(cfg_get("OOT_VOLUME"), "70"), "environment wins over cfg_set");
     CHECK(EQ(held, "40"), "a pointer cfg_get handed out stays valid after cfg_set");
-    _putenv_s("OOT_VOLUME", "");
+    plat_setenv("OOT_VOLUME", "");
     CHECK(!cfg_from_env("OOT_VOLUME") && EQ(cfg_get("OOT_VOLUME"), "90"), "cfg_set value returns without the variable");
     plat_file_delete(path);
     CHECK(cfg_save_to(path) == 1, "cfg_save_to creates a missing file");
@@ -150,7 +151,7 @@ int probe_cfg(void) {
     // cfg_reset: the key's active lines leave oot.ini, the commented example stays
     static const char rbase[] = "[audio]\n# volume = 100\n[input]\nmotion = 0\n";
     static const char *const vol[] = {"VOLUME"};
-    _putenv_s("OOT_VOLUME", "");
+    plat_setenv("OOT_VOLUME", "");
     CHECK(plat_file_write(path, rbase, sizeof rbase - 1), "write the reset ini");
     CHECK(cfg_load(path) == 1, "load the reset ini");
     cfg_set("OOT_VOLUME", "40");
@@ -189,9 +190,9 @@ int probe_cfg(void) {
 
     // a key the environment sets is skipped and keeps its file line
     CHECK(cfg_load(path) == 1 && EQ(cfg_get("OOT_VOLUME"), "60"), "reset: reload");
-    _putenv_s("OOT_VOLUME", "70");
+    plat_setenv("OOT_VOLUME", "70");
     CHECK(cfg_reset(vol, 1) == 0, "reset: an environment-set key is skipped");
-    _putenv_s("OOT_VOLUME", "");
+    plat_setenv("OOT_VOLUME", "");
     CHECK(EQ(cfg_get("OOT_VOLUME"), "60"), "reset: the skipped key keeps its value");
     CHECK(cfg_save_to(path) == 1, "reset: save after a skip");
     got = plat_file_read(path, &got_n);
@@ -355,24 +356,24 @@ int probe_cfg(void) {
     CHECK(!strcmp(line, "none"), "edit: a stick direction without keys is none");
     // defaults live in the CfgMeta table: cfg_value and the typed accessors fall back to it
     cfg_load("cfg-probe-missing.ini");
-    _putenv_s("OOT_FPS60", "");
-    _putenv_s("OOT_MOUSE_SENS", "");
-    _putenv_s("OOT_FREE_CORES", "");
+    plat_setenv("OOT_FPS60", "");
+    plat_setenv("OOT_MOUSE_SENS", "");
+    plat_setenv("OOT_FREE_CORES", "");
     CHECK(cfg_bool("OOT_FPS60") == 1, "default: unset FPS60 is on");
     CHECK(EQ(cfg_value("OOT_VK_PRESENT"), "mailbox") && cfg_int("OOT_SPLIT_DRAWS") == 64, "default: text and integer");
-    _putenv_s("OOT_MOUSE_SENS", "2.5");
+    plat_setenv("OOT_MOUSE_SENS", "2.5");
     CHECK(cfg_double("OOT_MOUSE_SENS") == 2.5, "double: the environment value");
-    _putenv_s("OOT_MOUSE_SENS", "fast");
+    plat_setenv("OOT_MOUSE_SENS", "fast");
     CHECK(cfg_double("OOT_MOUSE_SENS") == 1.0, "double: a value that does not parse gives the default");
-    _putenv_s("OOT_MOUSE_SENS", "");
+    plat_setenv("OOT_MOUSE_SENS", "");
     cfg_set("OOT_MOUSE_SENS", "3");
     CHECK(cfg_double("OOT_MOUSE_SENS") == 3.0 && cfg_int("OOT_MOUSE_SENS") == 3, "a cfg_set value beats the default");
     CHECK(cfg_bool("OOT_FREE_CORES") == 0, "free_cores unset: off");
-    _putenv_s("OOT_FREE_CORES", "0");
+    plat_setenv("OOT_FREE_CORES", "0");
     CHECK(cfg_bool("OOT_FREE_CORES") == 0, "free_cores 0 gives the same as unset");
-    _putenv_s("OOT_FREE_CORES", "1");
+    plat_setenv("OOT_FREE_CORES", "1");
     CHECK(cfg_bool("OOT_FREE_CORES") == 1, "free_cores 1: on");
-    _putenv_s("OOT_FREE_CORES", "");
+    plat_setenv("OOT_FREE_CORES", "");
     cfg_load("cfg-probe-missing.ini");
     int listed = 0;
     for (int i = 0; cfg_meta_at(i); i++) {
@@ -381,7 +382,7 @@ int probe_cfg(void) {
         listed++;
         char name[96];
         snprintf(name, sizeof name, "OOT_%s", m->key);
-        _putenv_s(name, "");
+        plat_setenv(name, "");
         CHECK(EQ(cfg_value(name), m->def), "cfg_value returns the table default");
         int ok = 0;
         if (!m->values) ok = 1;

@@ -13,12 +13,16 @@
 // TotK also checked nnMain's SetFocusHandlingMode call on the way; this game does not import it (nor did FE3H), so
 // that checkpoint (ov_system.c) never fires here.
 // With --seconds S the run continues past that call; rt_frame_presented ends it once the world clock passed S.
-#include <windows.h>
+#ifdef _WIN32
+#include <windows.h>   // the process start time, for the start-up log (rt_boot)
+#endif
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfg.h"
+#include "platform/platform.h"
 #include "fs.h"
 #include "gfx.h"
 #include "nvn_api.h"
@@ -41,7 +45,7 @@ static const struct { int version; uint64_t ret; } nvn_rets[] = {{111, 0x346bf8c
 typedef struct { const char *name; uint64_t entries; } InitCount;
 static const InitCount expected_inits[] = {{"main", 9783}, {"subsdk0", 0}, {"sdk", 96}};
 
-static volatile LONG inits_done, checkpoint_seen;
+static volatile int32_t inits_done, checkpoint_seen;
 uint64_t rt_guest_start_ns;
 
 static const RtLoaded *module_named(const char *name) {
@@ -84,7 +88,7 @@ static void cb_loader_ready(Cpu *c) {
 // DT_INIT registers the module with musl (__nnmusl_init_dso) and runs its init_array; the constructor flag reads 2
 // afterwards (MacNativeGames loader.c:458-462).
 static void cb_module_inits(Cpu *c) {
-    if (InterlockedCompareExchange(&inits_done, 0, 0)) rt_fatal("boot: module constructors requested twice");
+    if (__atomic_load_n(&inits_done, __ATOMIC_SEQ_CST)) rt_fatal("boot: module constructors requested twice");
     for (unsigned k = 0; k < sizeof expected_inits / sizeof *expected_inits; k++) {
         const RtLoaded *m = module_named(expected_inits[k].name);
         uint64_t entries = m->init_array_size / 8;
@@ -98,7 +102,7 @@ static void cb_module_inits(Cpu *c) {
             rt_fatal("boot: %s has %llu init_array entries, this game version has %llu", m->name, (unsigned long long)entries,
                      (unsigned long long)expected_inits[k].entries);
     }
-    InterlockedExchange(&inits_done, 1);
+    __atomic_exchange_n(&inits_done, 1, __ATOMIC_SEQ_CST);
 }
 
 static void cb_module_finis(Cpu *c) {
@@ -122,12 +126,12 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
         if (ret != main_mod->base + CHECKPOINT_RET)
             rt_fatal("boot: checkpoint %s reached from %s, expected main+%#llx", detail, at,
                      (unsigned long long)CHECKPOINT_RET);
-        if (!InterlockedCompareExchange(&inits_done, 0, 0)) rt_fatal("boot: checkpoint %s before DT_INIT", detail);
+        if (!__atomic_load_n(&inits_done, __ATOMIC_SEQ_CST)) rt_fatal("boot: checkpoint %s before DT_INIT", detail);
         for (int i = 0; i < ldr_count(); i++)
             if (ctor_state(ldr_module(i)) != CTOR_DONE)
                 rt_fatal("boot: checkpoint %s: %s constructor flag reads %u", detail, ldr_module(i)->name,
                          ctor_state(ldr_module(i)));
-        InterlockedExchange(&checkpoint_seen, 1);
+        __atomic_exchange_n(&checkpoint_seen, 1, __ATOMIC_SEQ_CST);
         rt_logf("boot: checkpoint %s from main+%#llx\n", detail, (unsigned long long)(ret - main_mod->base));
         return;
     }
@@ -135,7 +139,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
         if (ret != main_mod->base + nvn_ret())
             rt_fatal("boot: first NVN call %s(\"%s\") from %s, expected main+%#llx", "nvnBootstrapLoader", detail, at,
                      (unsigned long long)nvn_ret());
-        if (!InterlockedCompareExchange(&inits_done, 0, 0)) rt_fatal("boot: first NVN call before DT_INIT");
+        if (!__atomic_load_n(&inits_done, __ATOMIC_SEQ_CST)) rt_fatal("boot: first NVN call before DT_INIT");
         rt_logf("boot: first NVN call nvnBootstrapLoader(\"%s\") from main+%#llx\n", detail,
                (unsigned long long)(ret - main_mod->base));
         if (rt_config()->seconds) return;   // --seconds: the run goes on into the world
@@ -143,7 +147,7 @@ void rt_boot_event(const char *what, Cpu *c, const char *detail) {
         stats_line();
         fflush(stdout);
         fflush(stderr);
-        _exit(0);   // other guest threads are still running; nothing of theirs needs an orderly end
+        _Exit(0);   // other guest threads are still running; nothing of theirs needs an orderly end
     }
     rt_fatal("boot: unknown boot event %s (%s) from %s", what, detail ? detail : "", at);
 }
@@ -278,7 +282,7 @@ static void box_filter(const uint8_t *px, uint32_t w, uint32_t h, int bgra, uint
 #define RING_H 450
 static struct { uint8_t *px; uint64_t frame; } *ring;
 static int ring_n, ring_next, ring_full;
-static SRWLOCK ring_lock = SRWLOCK_INIT;
+static PlatMutex ring_lock = PLAT_MUTEX_INIT;
 static void ring_shot(const tex_t *t, uint64_t n) {
     static int parsed, on;
     static unsigned long long at;
@@ -312,7 +316,7 @@ static void ring_shot(const tex_t *t, uint64_t n) {
     if (gfx_replay_async()) gfx_backend()->finish();
     gfx_backend()->read_texels(t, &view, &r, px, 4ull * w, 4ull * w * h);
     flip_rows(px, w, h);
-    AcquireSRWLockExclusive(&ring_lock);
+    plat_mutex_lock(&ring_lock);
     box_filter(px, w, h, bgra, ring[ring_next].px, RING_W, RING_H);
     ring[ring_next].frame = n;
     static unsigned long long when_blue = ULLONG_MAX, when_from;
@@ -333,21 +337,21 @@ static void ring_shot(const tex_t *t, uint64_t n) {
         }
     }
     if (++ring_next == ring_n) ring_next = 0, ring_full = 1;
-    ReleaseSRWLockExclusive(&ring_lock);
+    plat_mutex_unlock(&ring_lock);
     if (at && n == at) rt_shot_ring_dump();
 }
-typedef struct { int n; struct { uint8_t *px; uint64_t frame; } *f; char dir[MAX_PATH]; } RingDump;
-static DWORD WINAPI ring_write_main(void *arg) {
+#define BOOT_PATH_MAX 4096
+typedef struct { int n; struct { uint8_t *px; uint64_t frame; } *f; char dir[BOOT_PATH_MAX]; } RingDump;
+static void ring_write_main(void *arg) {
     RingDump *d = arg;
     for (int i = 0; i < d->n; i++) {
-        char path[MAX_PATH];
+        char path[BOOT_PATH_MAX];
         snprintf(path, sizeof path, "%s/ring_f%05llu.png", d->dir, (unsigned long long)d->f[i].frame);
         rt_write_png(path, d->f[i].px, RING_W, RING_H);
         free(d->f[i].px);
     }
     rt_log("boot: shot ring: %d presents written to %s", d->n, d->dir);
     free(d->f), free(d);
-    return 0;
 }
 void rt_shot_ring_dump(void) {
     if (!ring) return;
@@ -355,8 +359,8 @@ void rt_shot_ring_dump(void) {
     if (!d) return;
     const char *dir = cfg_get("OOT_SHOTS_DIR") ? cfg_get("OOT_SHOTS_DIR") : ".";
     snprintf(d->dir, sizeof d->dir, "%s", dir);
-    CreateDirectoryA(d->dir, NULL);
-    AcquireSRWLockExclusive(&ring_lock);
+    plat_file_mkdir_p(d->dir);
+    plat_mutex_lock(&ring_lock);
     int n = ring_full ? ring_n : ring_next, first = ring_full ? ring_next : 0;
     d->f = calloc((size_t)(n ? n : 1), sizeof *d->f);
     if (d->f)
@@ -368,10 +372,10 @@ void rt_shot_ring_dump(void) {
             else n = i;
         }
     d->n = d->f ? n : 0;
-    ReleaseSRWLockExclusive(&ring_lock);
+    plat_mutex_unlock(&ring_lock);
     rt_log("boot: shot ring: writing %d presents to %s", d->n, d->dir);
-    HANDLE h = CreateThread(NULL, 0, ring_write_main, d, 0, NULL);
-    if (h) CloseHandle(h);
+    PlatThread *h = plat_thread_new(ring_write_main, d, "shot ring");
+    if (h) plat_thread_detach(h);
     else ring_write_main(d);
 }
 
@@ -393,7 +397,7 @@ static void series_shot(const tex_t *t, uint64_t n) {
             step = (unsigned long long)(ws * 1e6), next = lo;
         else if (!e || sscanf(e, "%llu-%llu:%llu", &lo, &hi, &step) != 3 || !step) hi = 0;
         dir = cfg_get("OOT_SHOTS_DIR") ? cfg_get("OOT_SHOTS_DIR") : ".";
-        if (hi) CreateDirectoryA(dir, NULL);
+        if (hi) plat_file_mkdir_p(dir);
         parsed = 1;
     }
     if (world) {   // the first present at or after each step of the world clock
@@ -416,7 +420,7 @@ static void series_shot(const tex_t *t, uint64_t n) {
     gfx_backend()->read_texels(t, &view, &r, px, 4ull * w, 4ull * w * h);
     flip_rows(px, w, h);
     box_filter(px, w, h, bgra, out, ow, oh);
-    char path[MAX_PATH];
+    char path[BOOT_PATH_MAX];
     snprintf(path, sizeof path, "%s/f%05llu.png", dir, (unsigned long long)n);
     rt_write_png(path, out, ow, oh);
     free(out);
@@ -447,7 +451,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     vk_pipeline_save();   // no-op without the Vulkan back end
     prof_write();
     fflush(stderr);
-    _exit(0);
+    _Exit(0);
 }
 
 // ---- steps 9-14
@@ -463,22 +467,21 @@ static void guest_main(Cpu *c) {
     rt_fatal("boot: nn::init::Start returned");
 }
 
-static DWORD WINAPI prewarm_main(void *arg) {
+static void prewarm_main(void *arg) {
     (void)arg;
     vk_pipeline_prewarm();
     const char *prep = cfg_get("OOT_TEST_PREPARE_SHADERS");   // Task 2.3 test hook; Task 2.6 builds the preparation
     if (prep && !strcmp(prep, "1")) {
-        int cpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+        int cpus = (int)plat_cpu_count();
         gfx_shader_prepare_recorded(cpus, cpus / 2 > 16 ? 16 : cpus / 2 < 1 ? 1 : cpus / 2);
     }
-    return 0;
 }
 
 void rt_boot(void) {
     check_npdm();
     if (!rt_config()->shot) vk_pipeline_async_enable();   // a --shot image must not depend on build timing
     // Shaders and pipelines recorded in earlier runs are made ready while the modules load; the guest waits for them.
-    HANDLE warm = CreateThread(NULL, 0, prewarm_main, NULL, 0, NULL);
+    PlatThread *warm = plat_thread_new(prewarm_main, NULL, "prewarm");
     ldr_load(rt_config()->exefs);
     rt_patches_init();
     frame_step_init();
@@ -487,10 +490,11 @@ void rt_boot(void) {
     cb_addr[1] = hostfn_register("<rtld module_inits>", cb_module_inits);
     cb_addr[2] = hostfn_register("<rtld module_finis>", cb_module_finis);
     hostfn_seal();
-    ULONGLONG held = GetTickCount64();
-    if (warm) WaitForSingleObject(warm, INFINITE), CloseHandle(warm);
+    uint64_t held = plat_tick_ms();
+    if (warm) plat_thread_join(warm);
     else vk_pipeline_prewarm();
-    held = GetTickCount64() - held;
+    held = plat_tick_ms() - held;
+#ifdef _WIN32
     FILETIME created, x0, x1, x2, now;
     GetProcessTimes(GetCurrentProcess(), &created, &x0, &x1, &x2);
     GetSystemTimeAsFileTime(&now);
@@ -498,6 +502,9 @@ void rt_boot(void) {
                    n = {.LowPart = now.dwLowDateTime, .HighPart = now.dwHighDateTime};
     rt_log("boot: guest starts %llu ms after process start (%llu ms of it waiting for the prewarm)",
            (unsigned long long)((n.QuadPart - c.QuadPart) / 10000), (unsigned long long)held);
+#else
+    rt_log("boot: guest starts (%llu ms of it waiting for the prewarm)", (unsigned long long)held);
+#endif
     rt_guest_start_ns = kern_now_ns();
     kern_run_on_guest_main(guest_main);
     rt_fatal("boot: the guest main thread ended");

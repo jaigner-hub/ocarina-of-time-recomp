@@ -9,13 +9,13 @@
 // (answers from OOT_SWKBD_ANSWER, then the window pressed by OOT_SWKBD_TEST) and the shared fonts when
 // tools/extract_fonts.py has written them. The named fatal stubs, and the account UID of a second run, are checked in
 // child processes (this executable again, OOT_PROBE_SERVICES_CHILD=<case>).
-#include <windows.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "child_run.h"
 #include "cfg.h"
 #include "fs.h"
 #include "gfx.h"
@@ -244,11 +244,11 @@ static char *lang(void) {
     return s;
 }
 
-static void set_env(const char *name, const char *value) { _putenv_s(name, value ? value : ""); }
+static void set_env(const char *name, const char *value) { plat_setenv(name, value ? value : ""); }
 
 static void probe_oe(void) {
-    char *keep_lang = cfg_get("OOT_LANG") ? _strdup(cfg_get("OOT_LANG")) : NULL;
-    char *keep_locale = cfg_get("OOT_LOCALE") ? _strdup(cfg_get("OOT_LOCALE")) : NULL;
+    char *keep_lang = cfg_get("OOT_LANG") ? strdup(cfg_get("OOT_LANG")) : NULL;
+    char *keep_locale = cfg_get("OOT_LOCALE") ? strdup(cfg_get("OOT_LOCALE")) : NULL;
     static const struct { const char *lang, *locale, *want; } cases[] = {
         {NULL, "en-US", "en-US"}, {NULL, "be-BY", "en-US"}, {NULL, "xx", "en-US"},     {NULL, "ja-JP", "ja"},
         {NULL, "fr-CA", "fr-CA"}, {NULL, "es-MX", "es-419"}, {NULL, "es_ES", "es"},     {NULL, "zh-Hant-TW", "zh-Hant"},
@@ -307,7 +307,7 @@ static void probe_oe(void) {
     CALL("oe.GetExpectedVolumeBalance", U(&l), U(&r));
     CHECK(l == 0.25f && r == 0.75f, "volume balance %g/%g", (double)l, (double)r);
     int64_t t1 = (int64_t)CALL("oe.GetProgramTotalActiveTime", 0);
-    Sleep(2);
+    plat_sleep_ns(2000000);
     int64_t t2 = (int64_t)CALL("oe.GetProgramTotalActiveTime", 0);
     CHECK(t1 > 0 && t2 > t1, "program total active time %lld, %lld", (long long)t1, (long long)t2);
     CALL("oe.SetUserInactivityDetectionTimeExtended", 1);
@@ -315,11 +315,10 @@ static void probe_oe(void) {
     CALL("oe.FinishStartupLogo", 0);
 }
 
-static DWORD WINAPI late_push(void *p) {
+static void late_push(void *p) {
     (void)p;
-    Sleep(50);
+    plat_sleep_ns(50000000);
     oe_push_message(0x21);
-    return 0;
 }
 
 static void probe_messages(void) {
@@ -329,12 +328,11 @@ static void probe_messages(void) {
     oe_push_message(0x20);
     CHECK((uint8_t)CALL("oe.TryPopNotificationMessage", U(&m)) == 1 && m == 0x1f, "TryPop after a push: %#x", m);
     CHECK((uint32_t)CALL("oe.PopNotificationMessage", 0) == 0x20, "Pop after a push");
-    HANDLE h = CreateThread(NULL, 0, late_push, NULL, 0, NULL);
+    PlatThread *h = plat_thread_new(late_push, NULL, "late-push");
     uint64_t t0 = kern_now_ns();
     uint32_t late = (uint32_t)CALL("oe.PopNotificationMessage", 0);
     uint64_t waited = kern_now_ns() - t0;
-    WaitForSingleObject(h, INFINITE);
-    CloseHandle(h);
+    plat_thread_join(h);
     CHECK(late == 0x21 && waited >= 40000000, "blocking Pop got %#x after %llu ms", late,
           (unsigned long long)(waited / 1000000));
     printf("oe: notification messages pushed then popped (TryPop, Pop, Pop blocked %llu ms until a host push): %s\n",
@@ -488,8 +486,8 @@ static void probe_feedback(uint32_t pid, uint32_t style) {
           "six-axis handle %#x", sh[0]);
     CHECK((int32_t)CALL("hid.GetVibrationDeviceHandles", U(dual), 2, U(&zero), 4) == 2 && dual[0] == 5 &&
           dual[1] == 0x10005, "Joy-Con pair vibration handles %#x %#x (SDK: 0x5 0x10005)", dual[0], dual[1]);
-    char *keep_r = cfg_get("OOT_RUMBLE") ? _strdup(cfg_get("OOT_RUMBLE")) : NULL;
-    char *keep_m = cfg_get("OOT_MOTION") ? _strdup(cfg_get("OOT_MOTION")) : NULL;
+    char *keep_r = cfg_get("OOT_RUMBLE") ? strdup(cfg_get("OOT_RUMBLE")) : NULL;
+    char *keep_m = cfg_get("OOT_MOTION") ? strdup(cfg_get("OOT_MOTION")) : NULL;
     set_env("OOT_RUMBLE", "0");
     set_env("OOT_MOTION", "0");
     uint32_t none[2] = {0xdead, 0xdead}, six_off[2] = {0};
@@ -660,18 +658,42 @@ static uint64_t sdk(const char *name) {
     return a;
 }
 
+// UTF-8 to NUL-terminated UTF-16 in out (cap units, surrogate pairs for the characters past the BMP). 0 when it does
+// not fit; invalid bytes become U+FFFD.
+static size_t utf16_of(const char *utf8, uint16_t *out, size_t cap) {
+    const unsigned char *p = (const unsigned char *)utf8;
+    size_t k = 0;
+    while (*p) {
+        uint32_t c = *p++, extra = 0;
+        if (c >= 0xf0 && c < 0xf8) c &= 0x07, extra = 3;
+        else if (c >= 0xe0) c &= 0x0f, extra = c > 0x0f ? 0 : 2;
+        else if (c >= 0xc0) c &= 0x1f, extra = 1;
+        else if (c >= 0x80) c = 0xfffd;
+        for (uint32_t i = 0; i < extra && (*p & 0xc0) == 0x80; i++) c = c << 6 | (*p++ & 0x3f);
+        if (c >= 0x10000) {
+            if (k + 3 > cap) return 0;
+            c -= 0x10000;
+            out[k++] = (uint16_t)(0xd800 | (c >> 10));
+            out[k++] = (uint16_t)(0xdc00 | (c & 0x3ff));
+        } else {
+            if (k + 2 > cap) return 0;
+            out[k++] = (uint16_t)c;
+        }
+    }
+    out[k++] = 0;
+    return k;
+}
+
 // NUL-terminated UTF-16 copy of utf8 in guest memory
 static uint16_t *u16(const char *utf8) {
     uint16_t *g = guest_alloc(0x200);
-    wchar_t w[128];
-    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, 128);
-    memcpy(g, w, (size_t)(n > 0 ? n : 1) * 2);
+    if (!utf16_of(utf8, g, 0x100)) g[0] = 0;
     return g;
 }
 
 static int u16_is(const uint16_t *a, const char *utf8) {
-    wchar_t b[128];
-    if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, b, 128)) return 0;
+    uint16_t b[128];
+    if (!utf16_of(utf8, b, 128)) return 0;
     for (size_t i = 0;; i++) {
         if (a[i] != b[i]) return 0;
         if (!a[i]) return 1;
@@ -794,7 +816,7 @@ static void probe_menu_gate(void) {
 
 // ---- shared fonts: the extracted files when present (the missing case is a fatal child)
 static void probe_fonts(void) {
-    char dir[MAX_PATH], path[MAX_PATH + 32];
+    char dir[4096], path[4096 + 32];
     snprintf(path, sizeof path, "%s/0-standard.bfttf", ov_shared_font_dir(dir, sizeof dir));
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -803,8 +825,8 @@ static void probe_fonts(void) {
     }
     uint8_t head[12];
     size_t got = fread(head, 1, sizeof head, f);
-    _fseeki64(f, 0, SEEK_END);
-    int64_t len = _ftelli64(f);
+    fseek(f, 0, SEEK_END);
+    int64_t len = ftell(f);
     fclose(f);
     uint64_t size = CALL("pl.GetSharedFontSize", 0), addr = CALL("pl.GetSharedFontAddress", 0);
     CHECK(got == sizeof head && size && size + 8 == (uint64_t)len, "shared font 0: size %llu, file %lld bytes",
@@ -868,36 +890,12 @@ static void probe_main(Cpu *c) {
 // ---- child processes
 // Runs this executable again with the same command line and OOT_PROBE_SERVICES_CHILD=<mode>; its stdout and stderr
 // into out. Returns the exit code.
-static DWORD run_child(const char *mode, const char *env, char *out, size_t cap) {
-    SECURITY_ATTRIBUTES sa = {sizeof sa, NULL, TRUE};
-    HANDLE rd, wr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) rt_fatal("probe-services: CreatePipe (error %lu)", GetLastError());
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-    STARTUPINFOW si = {.cb = sizeof si, .dwFlags = STARTF_USESTDHANDLES, .hStdOutput = wr, .hStdError = wr};
-    PROCESS_INFORMATION pi;
-    wchar_t *cmd = _wcsdup(GetCommandLineW());
-    SetEnvironmentVariableA(CHILD_ENV, mode);
+static uint32_t run_child(const char *mode, const char *env, char *out, size_t cap) {
     char name[64] = "";
     const char *eq = env ? strchr(env, '=') : NULL;
-    if (eq) snprintf(name, sizeof name, "%.*s", (int)(eq - env), env), SetEnvironmentVariableA(name, eq + 1);
-    BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
-    SetEnvironmentVariableA(CHILD_ENV, NULL);
-    if (eq) SetEnvironmentVariableA(name, NULL);
-    free(cmd);
-    CloseHandle(wr);
-    if (!ok) rt_fatal("probe-services: CreateProcess for the %s child (error %lu)", mode, GetLastError());
-    size_t n = 0;
-    DWORD got;
-    while (n + 1 < cap && ReadFile(rd, out + n, (DWORD)(cap - 1 - n), &got, NULL) && got) n += got;
-    out[n] = 0;
-    char sink[512];
-    while (ReadFile(rd, sink, sizeof sink, &got, NULL) && got) {}
-    CloseHandle(rd);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
+    if (eq) snprintf(name, sizeof name, "%.*s", (int)(eq - env), env), plat_setenv(name, eq + 1);
+    uint32_t code = child_run_self("probe-services", CHILD_ENV, mode, out, cap);
+    if (eq) plat_setenv(name, NULL);
     return code;
 }
 
@@ -939,12 +937,12 @@ static int run_as_child(const char *mode) {
 
 static void probe_children(void) {
     static char out[16384];
-    DWORD code = run_child("uid", NULL, out, sizeof out);
+    uint32_t code = run_child("uid", NULL, out, sizeof out);
     unsigned long long hi = 0, lo = 0;
     const char *p = strstr(out, "child uid ");
     int parsed = p && sscanf(p + 10, "%16llx%16llx", &hi, &lo) == 2;
     int same = parsed && code == 0 && hi == probe_uid[1] && lo == probe_uid[0];
-    CHECK(same, "the second run's account UID differs (exit %lu): %s", code, out);
+    CHECK(same, "the second run's account UID differs (exit %u): %s", code, out);
     printf("account: UID %016llx%016llx in %s/account.uid, the same in a second run: %s\n",
            (unsigned long long)probe_uid[1], (unsigned long long)probe_uid[0], rt_config()->profile, same ? "yes" : "NO");
 
@@ -954,7 +952,7 @@ static void probe_children(void) {
     p = strstr(out, "child nvn: ");
     parsed = p && sscanf(p, "child nvn: known %llx expected %llx unknown %llx", &known, &expected, &unknown) == 3;
     int nvn_ok = parsed && code == 0 && known && known == expected && unknown == 0;
-    CHECK(nvn_ok, "child nvn: exit %lu, output: %s", code, out);
+    CHECK(nvn_ok, "child nvn: exit %u, output: %s", code, out);
     if (nvn_ok) ov("nvnBootstrapLoader")->calls++;
     printf("nvnBootstrapLoader: nvnDeviceGetProcAddress -> %#llx (proc table %#llx), unknown name -> %#llx\n", known,
            expected, unknown);
@@ -962,11 +960,11 @@ static void probe_children(void) {
     for (int i = 0; i < NFATAL; i++) {
         code = run_child(fatals[i].child, fatals[i].env, out, sizeof out);
         int ok = code == 70 && strstr(out, fatals[i].fatal);
-        CHECK(ok, "child %s: exit %lu, output: %s", fatals[i].child, code, out);
+        CHECK(ok, "child %s: exit %u, output: %s", fatals[i].child, code, out);
         if (ok) ov(fatals[i].key)->calls++;
         const char *line = strstr(out, "FATAL: ");
         int len = line ? (int)strcspn(line, "\r\n") : 0;
-        printf("fatal stub %-20s child exit %lu: %.*s\n", fatals[i].key, code, len, line ? line : "(no FATAL line)");
+        printf("fatal stub %-20s child exit %u: %.*s\n", fatals[i].key, code, len, line ? line : "(no FATAL line)");
     }
 }
 

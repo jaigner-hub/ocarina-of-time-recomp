@@ -10,7 +10,6 @@
 // Objects are stored in place in the NVN object memory the game provides (nvn_obj.h); every argument is read from the
 // AAPCS64 registers (host.h arg_x / arg_s / arg_p) and every result returned with ret_x. Command-buffer procs are in
 // nvn_api_cmd.c, the TOTK extension procs in nvn_ext.c.
-#include <windows.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -22,6 +21,7 @@
 #include "nvn_api.h"
 #include "nvn_hmap.h"
 #include "nvn_tex.h"
+#include "platform/platform.h"
 
 // ---------- Descriptor pools
 // An NVN texture or sampler id indexes the pool bound with SetTexturePool / SetSamplerPool; the back end keeps one slot
@@ -33,12 +33,12 @@
 typedef struct { uintptr_t key; int base, n; } DpoolBase;
 static DpoolBase g_tpools[16], g_spools[16];
 static int g_ntpools, g_nspools;
-static SRWLOCK g_dpool_lock = SRWLOCK_INIT;
+static PlatMutex g_dpool_lock = PLAT_MUTEX_INIT;
 
 static int dpool_slot(DpoolBase *tab, int *count, int limit, const dpool_t *p, int id, const char *what) {
     if (!p || !p->pool) return id;
     uintptr_t key = (uintptr_t)p->pool->mem + (uintptr_t)p->off;
-    AcquireSRWLockExclusive(&g_dpool_lock);
+    plat_mutex_lock(&g_dpool_lock);
     int base = -1;
     for (int i = 0; i < *count && base < 0; i++)
         if (tab[i].key == key) base = tab[i].base;
@@ -51,7 +51,7 @@ static int dpool_slot(DpoolBase *tab, int *count, int limit, const dpool_t *p, i
         tab[(*count)++] = (DpoolBase){key, base, p->n};
         NVN_LOG("%s pool %d: %d descriptors at slot base %d", what, *count - 1, p->n, base);
     }
-    ReleaseSRWLockExclusive(&g_dpool_lock);
+    plat_mutex_unlock(&g_dpool_lock);
     return base + id;
 }
 int nvn_tpool_slot(const dpool_t *p, int id) { return dpool_slot(g_tpools, &g_ntpools, 1 << 20, p, id, "texture"); }
@@ -212,8 +212,8 @@ static void sparse_layout(const nvn_texdesc *d, sparse_layout_t *o) {
         tiled++;
     }
     o->levels = tiled, o->w = tw, o->h = th, o->d = td;
-    static volatile LONG said;
-    if (InterlockedIncrement(&said) <= 4)
+    static volatile int32_t said;
+    if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 4)
         rt_log("nvn: sparse tile layout of %ux%ux%u format %#x target %d, %u levels: %dx%dx%d tiles, %d tiled levels", d->width,
                d->height, d->depth, d->format, d->target, d->levels, tw, th, td, tiled);
 }
@@ -225,7 +225,7 @@ NVN_API(nvnTextureBuilderGetSparseTileLayout) { sparse_layout(&TB(c)->d, arg_p(c
 // registering the descriptor again, as an NVN descriptor refers to memory and stays valid on hardware. The table maps
 // storage address -> a copy of the live texture so the back end can redirect a registration whose serial was finalized.
 static nvn_hmap live = {.klen = 8};
-static SRWLOCK live_lock = SRWLOCK_INIT;
+static PlatMutex live_lock = PLAT_MUTEX_INIT;
 
 static void live_put(const tex_t *o) {
     if (!o->mem) return;
@@ -233,30 +233,30 @@ static void live_put(const tex_t *o) {
     tex_t *copy = malloc(sizeof *copy);
     if (!copy) rt_fatal("nvn: out of memory for the live texture table");
     *copy = *o;
-    AcquireSRWLockExclusive(&live_lock);
+    plat_mutex_lock(&live_lock);
     tex_t *old = nvn_hm_put(&live, &k, copy);
-    ReleaseSRWLockExclusive(&live_lock);
+    plat_mutex_unlock(&live_lock);
     free(old);
 }
 
 static void live_del(const tex_t *o) {
     if (!o->mem) return;
     uint64_t k = (uintptr_t)o->mem;
-    AcquireSRWLockExclusive(&live_lock);
+    plat_mutex_lock(&live_lock);
     tex_t *cur = nvn_hm_get(&live, &k);
     if (cur && cur->serial == o->serial) nvn_hm_del(&live, &k);
     else cur = NULL;
-    ReleaseSRWLockExclusive(&live_lock);
+    plat_mutex_unlock(&live_lock);
     free(cur);
 }
 
 int nvn_tex_live_at(const void *mem, tex_t *out) {
     if (!mem) return 0;
     uint64_t k = (uintptr_t)mem;
-    AcquireSRWLockShared(&live_lock);
+    plat_mutex_lock_shared(&live_lock);
     const tex_t *cur = nvn_hm_get(&live, &k);
     if (cur) *out = *cur;
-    ReleaseSRWLockShared(&live_lock);
+    plat_mutex_unlock_shared(&live_lock);
     return cur != NULL;
 }
 
@@ -522,10 +522,10 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
     o->nstage = (uint32_t)n;
     if (n) memcpy(o->sd, sd, (size_t)n * sizeof *sd);
     if (getenv("OOT_PROG_DUMP")) {   // DIAG: the memory around a compute program's control section (NVN2 bank 0 layout)
-        static volatile LONG shown;
+        static volatile int32_t shown;
         for (int i = 0; i < n; i++) {
             const uint8_t *ctl = sd[i].control;
-            if (!ctl || ctl[0x56] != 5 || InterlockedIncrement(&shown) > 6) continue;
+            if (!ctl || ctl[0x56] != 5 || __atomic_add_fetch(&shown, 1, __ATOMIC_SEQ_CST) > 6) continue;
             rt_log("progdump: stage 5 data %#llx control %p", (unsigned long long)sd[i].data, (const void *)ctl);
             for (int off = -0x80; off < 0x300; off += 32) {
                 char line[3 * 32 + 1];
@@ -704,29 +704,29 @@ NVN_API(nvnWindowBuilderSetPresentInterval) { WB(c)->interval = (int)arg_x(c, 1)
 // The windows alive, for nvn_window_uses_pool (vk_backend.c: a pool holding a window texture is freed only after the
 // queued presents reading it were submitted). One window in practice; four is the NVN-side limit this keeps.
 static win_t *g_windows[4];
-static SRWLOCK g_windows_lock = SRWLOCK_INIT;
+static PlatMutex g_windows_lock = PLAT_MUTEX_INIT;
 
 static void window_track(win_t *o, int alive) {
-    AcquireSRWLockExclusive(&g_windows_lock);
+    plat_mutex_lock(&g_windows_lock);
     for (int i = 0; i < 4; i++)
         if (alive ? !g_windows[i] : g_windows[i] == o) {
             g_windows[i] = alive ? o : NULL;
             break;
         }
-    ReleaseSRWLockExclusive(&g_windows_lock);
+    plat_mutex_unlock(&g_windows_lock);
 }
 
 int nvn_window_uses_pool(const pool_t *p) {
     if (!p || !p->mem) return 0;
     uintptr_t lo = (uintptr_t)p->mem, hi = lo + p->size;
     int r = 0;
-    AcquireSRWLockShared(&g_windows_lock);
+    plat_mutex_lock_shared(&g_windows_lock);
     for (int i = 0; i < 4 && !r; i++)
         for (int k = 0; g_windows[i] && k < g_windows[i]->ntex && k < 4 && !r; k++) {
             const tex_t *t = (const tex_t *)g_windows[i]->tex[k];
             r = t && (uintptr_t)t->mem >= lo && (uintptr_t)t->mem < hi;
         }
-    ReleaseSRWLockShared(&g_windows_lock);
+    plat_mutex_unlock_shared(&g_windows_lock);
     return r;
 }
 
@@ -796,8 +796,8 @@ static void sleep_until(uint64_t deadline) {
         uint64_t now = kern_now_ns();
         if (now >= deadline) return;
         uint64_t d = deadline - now;
-        if (d >= 2000000) Sleep((DWORD)(d / 1000000 - 1));
-        else SwitchToThread();
+        if (d >= 2000000) plat_sleep_ns((d / 1000000 - 1) * 1000000ull);
+        else plat_yield();
     }
 }
 

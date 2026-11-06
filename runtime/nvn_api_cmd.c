@@ -15,7 +15,6 @@
 // recording into host memory; the handle is that copy (a flat OP_BEGIN ... OP_END sequence) and lives until the game
 // adds the same control memory again. CallCommands and CopyCommands inline the called recording, so copies hold no
 // OP_CALL or OP_JUMP.
-#include <windows.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -27,6 +26,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
+#include "platform/platform.h"
 
 #define CMD_MAGIC MAGIC('C', 'M', 'D', 'B')
 #define COPY_MAGIC 0x59504f43444d43ull     // "CMDCOPY": prefix of a live recording copy
@@ -44,23 +44,23 @@ static cmd_t *cmd_of(const Cpu *c) { return arg_p(c, 0); }
 // without any command memory, or ends without any control memory. It runs on the calling guest thread through
 // rt_call; whatever memory it adds is accounted. Set{Command,Control}MemoryCallbackEnabled(false) suppress it.
 enum { CB_NO_COMMAND = 1, CB_NO_CONTROL = 2 };
-static SRWLOCK cb_lock = SRWLOCK_INIT;
+static PlatMutex cb_lock = PLAT_MUTEX_INIT;
 static nvn_hmap cb_off = {.klen = 8};       // command buffer -> disabled callback kinds | 0x100
 
 static unsigned cb_disabled(const cmd_t *o) {
-    AcquireSRWLockShared(&cb_lock);
+    plat_mutex_lock_shared(&cb_lock);
     uintptr_t v = (uintptr_t)nvn_hm_get(&cb_off, &o);
-    ReleaseSRWLockShared(&cb_lock);
+    plat_mutex_unlock_shared(&cb_lock);
     return (unsigned)v & 0xff;
 }
 
 static void cb_set_disabled(const cmd_t *o, unsigned kind, int disabled) {
-    AcquireSRWLockExclusive(&cb_lock);
+    plat_mutex_lock(&cb_lock);
     unsigned v = (unsigned)(uintptr_t)nvn_hm_get(&cb_off, &o) & 0xff;
     v = disabled ? v | kind : v & ~kind;
     if (v) nvn_hm_put(&cb_off, &o, (void *)(uintptr_t)(v | 0x100));
     else nvn_hm_del(&cb_off, &o);
-    ReleaseSRWLockExclusive(&cb_lock);
+    plat_mutex_unlock(&cb_lock);
 }
 
 static void memory_event(Cpu *c, cmd_t *o, int event, uint64_t min) {
@@ -137,7 +137,7 @@ static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) {
 // Recordings refer to textures by pointer, but the game may finalize or reuse an NVNtexture after recording and before
 // the submit (NVN itself captured only GPU state). Records therefore point at an immutable host copy per texture
 // initialization (tex_t.serial). The copies are kept for the whole run (MacNativeGames sweeps them for long sessions).
-static SRWLOCK pin_lock = SRWLOCK_INIT;
+static PlatMutex pin_lock = PLAT_MUTEX_INIT;
 static nvn_hmap pins = {.klen = 8};         // serial -> tex_t copy
 
 static const tex_t *tex_pin(const NVNtexture *nt) {
@@ -145,11 +145,11 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
     if (!t) return NULL;
     uint64_t serial = t->serial;
     if (!serial) rt_fatal("nvn: a recording references the uninitialized texture object %p", (const void *)t);
-    AcquireSRWLockShared(&pin_lock);
+    plat_mutex_lock_shared(&pin_lock);
     const tex_t *r = nvn_hm_get(&pins, &serial);
-    ReleaseSRWLockShared(&pin_lock);
+    plat_mutex_unlock_shared(&pin_lock);
     if (r) return r;
-    AcquireSRWLockExclusive(&pin_lock);
+    plat_mutex_lock(&pin_lock);
     r = nvn_hm_get(&pins, &serial);
     if (!r) {
         tex_t *copy = malloc(sizeof *copy);
@@ -158,7 +158,7 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
         nvn_hm_put(&pins, &serial, copy);
         r = copy;
     }
-    ReleaseSRWLockExclusive(&pin_lock);
+    plat_mutex_unlock(&pin_lock);
     return r;
 }
 
@@ -171,7 +171,7 @@ typedef struct { uint64_t magic, bytes, made_at, used_at, deferred; } copy_prefi
 _Static_assert(sizeof(copy_prefix) % 8 == 0, "records stay 8-byte aligned");
 typedef struct { uintptr_t lo, hi; uint8_t *copy; } cmd_copy;
 typedef struct { cmd_copy *v; uint32_t n, cap; } copy_bucket;
-static SRWLOCK copy_lock = SRWLOCK_INIT;    // guards the two maps, the counters and every prefix
+static PlatMutex copy_lock = PLAT_MUTEX_INIT;    // guards the two maps, the counters and every prefix
 static nvn_hmap copy_pages = {.klen = 8};   // page -> copy_bucket
 static nvn_hmap copy_live = {.klen = 8};    // handle -> copy_prefix of a live copy
 static uint64_t ncopies, copy_bytes, copies_made, nsubmits;
@@ -205,27 +205,27 @@ static copy_prefix *copy_find(uint64_t handle) {   // copy_lock held
 }
 
 int nvn_handle_live(uint64_t handle) {
-    AcquireSRWLockShared(&copy_lock);
+    plat_mutex_lock_shared(&copy_lock);
     int live = copy_find(handle) != NULL;
-    ReleaseSRWLockShared(&copy_lock);
+    plat_mutex_unlock_shared(&copy_lock);
     return live;
 }
 
 uint64_t nvn_handle_bytes(uint64_t handle) {
-    AcquireSRWLockShared(&copy_lock);
+    plat_mutex_lock_shared(&copy_lock);
     const copy_prefix *pf = copy_find(handle);
     uint64_t n = pf ? pf->bytes : 0;
-    ReleaseSRWLockShared(&copy_lock);
+    plat_mutex_unlock_shared(&copy_lock);
     return n;
 }
 
 // Marks a live copy used by submission now; its size from OP_BEGIN to OP_END inclusive.
 static uint64_t copy_touch(uint64_t handle, uint64_t now, const char *what) {
-    AcquireSRWLockShared(&copy_lock);
+    plat_mutex_lock_shared(&copy_lock);
     copy_prefix *pf = copy_find(handle);
     uint64_t bytes = 0;
     if (pf) __atomic_store_n(&pf->used_at, now, __ATOMIC_RELAXED), bytes = pf->bytes;
-    ReleaseSRWLockShared(&copy_lock);
+    plat_mutex_unlock_shared(&copy_lock);
     if (!pf) rt_fatal("nvn: %s: command handle %#llx is not a live recording (released or never recorded)", what,
                       (unsigned long long)handle);
     return bytes;
@@ -258,7 +258,7 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     copy_prefix *pf = (copy_prefix *)copy - 1;
     uint64_t handle = (uintptr_t)copy;
     uintptr_t page = lo >> COPY_PAGE_SHIFT;
-    AcquireSRWLockExclusive(&copy_lock);
+    plat_mutex_lock(&copy_lock);
     pf->made_at = nsubmits;
     copy_bucket *b = nvn_hm_get(&copy_pages, &page);
     if (!b) {
@@ -278,14 +278,14 @@ static void copy_add(uintptr_t lo, uintptr_t hi, uint8_t *copy) {
     if (++copies_made % 20000 == 0)
         NVN_LOG("recording copies: %llu made, %llu live, %.1f MiB, submit %llu", (unsigned long long)copies_made,
                 (unsigned long long)ncopies, copy_bytes / 1048576.0, (unsigned long long)nsubmits);
-    ReleaseSRWLockExclusive(&copy_lock);
+    plat_mutex_unlock(&copy_lock);
 }
 
 // Adding control memory again retires every recording copy made in it (the driver's handle lived there).
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
     uint64_t replayed = gfx_replayed_submits();
-    AcquireSRWLockExclusive(&copy_lock);
+    plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
     for (uintptr_t pg = lo >> COPY_PAGE_SHIFT; pg <= (hi - 1) >> COPY_PAGE_SHIFT; pg++) {
         copy_bucket *b = nvn_hm_get(&copy_pages, &pg);
@@ -309,7 +309,7 @@ static void release_copies(uintptr_t lo, uintptr_t hi) {
             free(b);
         }
     }
-    ReleaseSRWLockExclusive(&copy_lock);
+    plat_mutex_unlock(&copy_lock);
 }
 
 // ---------- CommandBuffer: object and memory
@@ -468,8 +468,8 @@ NVN_API(nvnCommandBufferUpdateUniformBuffer) {
     r->size = n;
     memcpy(r->data, data, n);
     if (getenv("OOT_BIND_LOG") && gfx_stats().frames >= 290) {   // DIAG: the inline uniform writes around the movie's dispatches
-        static volatile LONG lines;
-        if (InterlockedIncrement(&lines) <= 40) {
+        static volatile int32_t lines;
+        if (__atomic_add_fetch(&lines, 1, __ATOMIC_SEQ_CST) <= 40) {
             const uint64_t *q = data;
             rt_log("bindlog: f%llu update_ub dst %#llx size %#llx: %#llx %#llx %#llx %#llx | +0x90.. %#llx %#llx %#llx %#llx %#llx",
                    (unsigned long long)gfx_stats().frames, (unsigned long long)dst, (unsigned long long)n,
@@ -578,19 +578,19 @@ NVN_API(nvnCommandBufferSetRasterizerDiscard) { REC(cmd_of(c), OP_RASTER_DISCARD
 // (for OOT_DUMP=xfb) and the control buffer's contents at begin and end (what the game pre-fills; End does not write
 // it back yet, the game has not been seen to read it).
 static void xfb_note(const char *what) {
-    static volatile LONG said[8];
+    static volatile int32_t said[8];
     int k = what[0] == 'B' && what[1] == 'i' ? 0 : what[0] == 'B' ? 1 : what[0] == 'E' ? 2 : what[0] == 'P' ? 3 : what[0] == 'R' ? 4 : 5;
-    if (k >= 3 && InterlockedIncrement(&said[k]) == 1) rt_log("nvn: transform feedback: %s is not replayed (dropped)", what);
-    static volatile LONG begins;
+    if (k >= 3 && __atomic_add_fetch(&said[k], 1, __ATOMIC_SEQ_CST) == 1) rt_log("nvn: transform feedback: %s is not replayed (dropped)", what);
+    static volatile int32_t begins;
     if (k != 1 || !cfg_bool("OOT_XFB_LOG")) return;
-    LONG nb = InterlockedIncrement(&begins);
+    int32_t nb = __atomic_add_fetch(&begins, 1, __ATOMIC_SEQ_CST);
     if (nb <= 40) rt_log("nvn: transform feedback begin %ld at frame %llu", (long)nb, (unsigned long long)gfx_stats().frames);
 }
 // void nvnCommandBufferBindTransformFeedbackBuffer(NVNcommandBuffer *cmd, int index, NVNbufferAddress addr, size_t size)
 NVN_API(nvnCommandBufferBindTransformFeedbackBuffer) {
     xfb_note("BindTransformFeedbackBuffer");
-    static volatile LONG said;   // the first bindings: which buffer the captured vertices go to (for finding their readers)
-    if (InterlockedIncrement(&said) <= 8)
+    static volatile int32_t said;   // the first bindings: which buffer the captured vertices go to (for finding their readers)
+    if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 8)
         rt_log("nvn: BindTransformFeedbackBuffer index %d addr %#llx size %#llx", (int)arg_x(c, 1), (unsigned long long)arg_x(c, 2),
                (unsigned long long)arg_x(c, 3));
     *REC(cmd_of(c), OP_XFB_BIND, p_xfb_bind) = (p_xfb_bind){(int32_t)arg_x(c, 1), 0, arg_x(c, 2), arg_x(c, 3)};
@@ -606,8 +606,8 @@ NVN_API(nvnCommandBufferBindTransformFeedbackBuffers) {
 // OOT_XFB_LOG=1 also prints the 32 bytes at the control address as recorded (what the game pre-fills: the offsets
 // Begin loads and End overwrites), for the first bracket pairs.
 static void xfb_control_log(const char *what, uint64_t control) {
-    static volatile LONG said;
-    if (!cfg_bool("OOT_XFB_LOG") || InterlockedIncrement(&said) > 8 || !control) return;
+    static volatile int32_t said;
+    if (!cfg_bool("OOT_XFB_LOG") || __atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) > 8 || !control) return;
     const uint32_t *w = (const uint32_t *)(uintptr_t)control;
     rt_log("nvn: %s control %#llx: %08x %08x %08x %08x %08x %08x %08x %08x", what, (unsigned long long)control, w[0], w[1], w[2], w[3],
            w[4], w[5], w[6], w[7]);
@@ -650,7 +650,7 @@ static _Thread_local const prog_t *bound_prog;
 static void draw_trace(Cpu *c, const char *what) {
     static int64_t want = -2;
     static unsigned long long from, to = ~0ull;
-    static volatile LONG said;
+    static volatile int32_t said;
     if (want == -2) {
         const char *e = cfg_get("OOT_TRACE_DRAW_PROG");
         char *q = NULL;
@@ -669,7 +669,7 @@ static void draw_trace(Cpu *c, const char *what) {
             if (seen[i][0] == serial && seen[i][1] == lr) return;
         if (nseen < 512) seen[nseen][0] = serial, seen[nseen++][1] = lr;
         else return;
-    } else if (InterlockedIncrement(&said) > 6) return;
+    } else if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) > 6) return;
     char buf[128];
     rt_log("nvn: %s under program %llu from %s at frame %llu", what, (unsigned long long)serial, ldr_describe(lr, buf, sizeof buf),
            (unsigned long long)frame);
@@ -749,11 +749,11 @@ static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n
 }
 // DIAG (NVN2 bank 0 layout): the compute stage's bindings and the start of a bound uniform buffer, a few times.
 static void bind_log(const char *what, int st, int first, int n, uint64_t a, uint64_t b) {
-    static volatile LONG lines;
+    static volatile int32_t lines;
     if ((st != 5 && !(what[0] == 'u' && st <= 1)) || !getenv("OOT_BIND_LOG") || gfx_stats().frames < 290) return;
     if (what[0] == 'u' && b == 0x100 && a && !*(const uint64_t *)(uintptr_t)a) return;   // the engine's dummy block, every frame
     if (what[0] == 't' && a == 0x10200102) return;                                       // the dummy texture
-    if (InterlockedIncrement(&lines) > 240) return;
+    if (__atomic_add_fetch(&lines, 1, __ATOMIC_SEQ_CST) > 240) return;
     rt_log("bindlog: f%llu %s stage %d slot %d n %d %#llx %#llx", (unsigned long long)gfx_stats().frames, what, st, first, n,
            (unsigned long long)a, (unsigned long long)b);
     if (what[0] == 'u' && a && b >= 0x100 && *(const uint64_t *)(uintptr_t)a) {
@@ -897,8 +897,8 @@ NVN_API(nvnCommandBufferDrawArraysIndirect) {
 // as OP_PUSH_CC, a p_update_ub whose dst is the byte offset.
 NVN_API(nvnCommandBufferPushComputeConstants) {
     uint64_t offset = arg_x(c, 2), n = arg_x(c, 3), data = arg_x(c, 4);
-    static volatile LONG said;
-    if (InterlockedIncrement(&said) <= 2)
+    static volatile int32_t said;
+    if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 2)
         rt_log("nvn: PushComputeConstants(%#llx, %#llx, %#llx bytes at %#llx)", (unsigned long long)arg_x(c, 1),
                (unsigned long long)offset, (unsigned long long)n, (unsigned long long)data);
     if (n > 0x7f0 || offset > 0x7f0 - n || !data) {
@@ -1071,12 +1071,12 @@ void nvn_submit_prepare(const uint64_t *handles, int n) {
 void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
     uint64_t now = __atomic_add_fetch(&nsubmits, 1, __ATOMIC_RELAXED);
     uint64_t replayed = gfx_replayed_submits();
-    AcquireSRWLockExclusive(&copy_lock);
+    plat_mutex_lock(&copy_lock);
     if (nzombies) zombie_sweep(replayed);
     for (int i = 0; i < n; i++) {
         copy_prefix *pf = copy_find(handles[i]);
         if (!pf) {
-            ReleaseSRWLockExclusive(&copy_lock);
+            plat_mutex_unlock(&copy_lock);
             rt_fatal("nvn: QueueSubmitCommands: command handle %#llx is not a live recording (released or never recorded)",
                      (unsigned long long)handles[i]);
         }
@@ -1095,7 +1095,7 @@ void nvn_submit_prepare_async(const uint64_t *handles, uint64_t *out, int n) {
             pf->used_at = now;
         }
     }
-    ReleaseSRWLockExclusive(&copy_lock);
+    plat_mutex_unlock(&copy_lock);
     for (int i = 0; i < n; i++) {
         int nd = resolve_deferred((const uint8_t *)(uintptr_t)out[i], 0);
         if (out[i] == handles[i]) ((copy_prefix *)(uintptr_t)out[i] - 1)->deferred = nd ? 2 : 1;

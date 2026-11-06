@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #include "cfg.h"
 #include "gfx.h"
@@ -20,6 +19,15 @@
 #include "vk.h"
 #include "vk_exec.h"
 #include "sm86_lower.h"
+#include "platform/platform.h"
+
+#define MAX_PATH 260   // the buffers keep the Windows sizes (MAX_PATH * 2) on both systems
+
+// The last path separator of s, either kind (Windows executables have backslashes): NULL when there is none.
+static char *path_sep(const char *s) {
+    char *a = strrchr(s, '/'), *b = strrchr(s, '\\');
+    return !a ? b : !b ? a : a > b ? a : b;
+}
 
 #define SUBMITS 100
 #define TAIL 10
@@ -35,14 +43,14 @@
         }                                                                                                              \
     } while (0)
 
-static DWORD main_tid;
+static uint32_t main_tid;
 static uint64_t ran[SUBMITS + TAIL + 8];
 static long nran, on_main;
 
 static void note(void *arg) {   // completion thread
     if (nran < (long)(sizeof ran / sizeof ran[0])) ran[nran] = (uint64_t)(uintptr_t)arg;
     nran++;
-    if (GetCurrentThreadId() == main_tid) on_main++;
+    if (plat_thread_id() == main_tid) on_main++;
 }
 
 typedef struct { volatile uint32_t *word; uint32_t value; } WordWrite;
@@ -131,7 +139,7 @@ static int test_present(const GfxBackend *b, uint8_t *guest, int *w_out, int *h_
 
     uint64_t frames = gfx_stats().frames;
     // the exact colour check needs the bilinear blit: FSR's approximate reciprocals move a flat colour by 1/255
-    _putenv_s("OOT_UPSCALER", "bilinear");
+    plat_setenv("OOT_UPSCALER", "bilinear");
     vk_present_capture(1);
     const int crop[4] = {0, 0, TEX_W, TEX_H};
     b->present(&t, crop, 0);
@@ -315,13 +323,12 @@ static char *dr_read(const char *path, long *size) {
 
 static int dr_root(char *root, size_t n) {
     char exe[MAX_PATH * 2];
-    DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!len || len >= sizeof exe) return 0;
-    for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
+    if (!plat_exe_path(exe, sizeof exe)) return 0;
+    for (char *cut = path_sep(exe); cut; cut = path_sep(exe)) {
         *cut = 0;
         char p[MAX_PATH * 2 + 40];
-        snprintf(p, sizeof p, "%s\\build\\v121\\shaders\\jobs.json", exe);
-        if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return snprintf(root, n, "%s", exe) < (int)n;
+        snprintf(p, sizeof p, "%s/build/v121/shaders/jobs.json", exe);
+        if (plat_file_exists(p)) return snprintf(root, n, "%s", exe) < (int)n;
     }
     return 0;
 }
@@ -335,7 +342,7 @@ static prog_t *dr_prog(const char *root, const DrawEnt *e[], int n) {
     p->magic = NVN_PROG_MAGIC, p->serial = ++serial;
     for (int i = 0; i < n; i++) {
         char path[MAX_PATH * 2 + 128];
-        snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\code\\%.64s.code", root, e[i]->key);
+        snprintf(path, sizeof path, "%s/build/v121/shaders/code/%.64s.code", root, e[i]->key);
         long body;
         char *raw = dr_read(path, &body);
         if (!raw) return free(p), NULL;
@@ -405,7 +412,7 @@ static int test_draw(const GfxBackend *b, uint8_t *guest, int *n_drawn, int *n_t
         printf("probe-vkexec: draw part skipped: build/v121/shaders/jobs.json (the TotK census) is not present\n");
         return 0;
     }
-    snprintf(path, sizeof path, "%s\\build\\v121\\shaders\\jobs.json", root);
+    snprintf(path, sizeof path, "%s/build/v121/shaders/jobs.json", root);
     long size;
     char *jobs = dr_read(path, &size);
     DrawEnt *e = malloc(sizeof *e * 20000);
@@ -862,7 +869,7 @@ static int test_mirror(const GfxBackend *b, uint8_t *guest, int *bytes) {
 
 int probe_vkexec(void) {
     layouts_equal = 0;
-    main_tid = GetCurrentThreadId();
+    main_tid = plat_thread_id();
     const GfxBackend *b = &gfx_vulkan_backend;
     uint64_t heap = 0;
     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
@@ -1104,7 +1111,7 @@ static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
 }
 
 int probe_tensor(void) {
-    main_tid = GetCurrentThreadId();
+    main_tid = plat_thread_id();
     const GfxBackend *b = &gfx_vulkan_backend;
     uint64_t heap = 0;
     CHECK(mem_set_heap_size(16ull << 20, &heap) == 0 && heap, "SetHeapSize 16 MiB");
@@ -1148,7 +1155,7 @@ static uint8_t *cs_read(const char *path, long *size) {
 }
 
 int probe_cs(const char *dir) {
-    main_tid = GetCurrentThreadId();
+    main_tid = plat_thread_id();
     const GfxBackend *b = &gfx_vulkan_backend;
     char path[MAX_PATH * 2];
     long ctl_size = 0, code_size = 0;
@@ -1211,7 +1218,7 @@ int probe_cs(const char *dir) {
         } else if (sscanf(line, "trunc %d", &x) == 1) {
             char v[32];
             snprintf(v, sizeof v, "%d", x);
-            _putenv_s("OOT_SM86_TRUNC", v);
+            plat_setenv("OOT_SM86_TRUNC", v);
             printf("probe-cs: lowering truncated after %d instructions\n", x);
         }
     }
@@ -1223,14 +1230,12 @@ int probe_cs(const char *dir) {
     printf("probe-cs: dispatch %dx%dx%d of a %ld-byte kernel with %d storage buffers\n", dp.x, dp.y, dp.z, code_size, nssbo);
     fflush(stdout);
     uint64_t handle = (uint64_t)(uintptr_t)stream;
-    LARGE_INTEGER qf, q0, q1;
-    QueryPerformanceFrequency(&qf);
     uint64_t f = b->submit(&handle, 1);
-    QueryPerformanceCounter(&q0);
+    uint64_t q0 = plat_now_ns();
     int done = b->fence_wait(f, 60000000000ull);
-    QueryPerformanceCounter(&q1);
+    uint64_t q1 = plat_now_ns();
     printf("probe-cs: fence %s after %.1f ms (the pipeline build is before the submit)\n", done ? "reached" : "TIMED OUT",
-           (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart);
+           (double)(q1 - q0) / 1e6);
     for (int i = 0; i < nssbo && done; i++) {
         snprintf(path, sizeof path, "%s/out_ssbo%d.bin", dir, ssbo[i].slot);
         FILE *o = fopen(path, "wb");

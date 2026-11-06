@@ -7,10 +7,19 @@
 // and textures uploaded from block-linear storage and read back.
 // The reference swizzler walks the GOBs in storage order and places each byte by bit operations, so it shares no
 // addressing code with nvn_bl_offset.
+#ifndef _WIN32
+#define _GNU_SOURCE   // O_DIRECT (the unbuffered read below)
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#include "platform/platform.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "tex.h"
@@ -377,35 +386,69 @@ static int test_import(pool_t *pool) {
     return 0;
 }
 
-// ReadFile into a watched page, buffered and unbuffered: timed, and whether write watch saw the kernel's write.
-static int test_readfile(uint8_t *dst) {
-    char dir[MAX_PATH], path[MAX_PATH];
-    GCHECK(GetTempPathA(MAX_PATH, dir) && GetTempFileNameA(dir, "tvk", 0, path), "temp file name");
-    static uint8_t data[0x2000];
-    for (size_t i = 0; i < sizeof data; i++) data[i] = rnd8();
+// The file calls of the ReadFile probe: a temporary file written whole, then read into a watched page with and without
+// the OS cache (Windows: ReadFile with FILE_FLAG_NO_BUFFERING; Linux: read with O_DIRECT, which needs the page aligned).
+#ifdef _WIN32
+static int tmp_make(char *path, size_t cap) {
+    char dir[MAX_PATH];
+    return GetTempPathA(MAX_PATH, dir) && GetTempFileNameA(dir, "tvk", 0, path) && cap > 0;
+}
+static int tmp_write(const char *path, const uint8_t *data, size_t n) {
     HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
     DWORD got = 0;
-    GCHECK(h != INVALID_HANDLE_VALUE && WriteFile(h, data, sizeof data, &got, NULL) && got == sizeof data, "temp file write");
-    CloseHandle(h);
-    LARGE_INTEGER f, t0, t1;
-    QueryPerformanceFrequency(&f);
+    int ok = h != INVALID_HANDLE_VALUE && WriteFile(h, data, (DWORD)n, &got, NULL) && got == n;
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    return ok;
+}
+static intptr_t file_open(const char *path, int unbuffered) {
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, unbuffered ? FILE_FLAG_NO_BUFFERING : 0, NULL);
+    return h == INVALID_HANDLE_VALUE ? -1 : (intptr_t)h;
+}
+static long file_read(intptr_t h, void *buf, size_t n) {
+    DWORD got = 0;
+    return ReadFile((HANDLE)h, buf, (DWORD)n, &got, NULL) ? (long)got : -1;
+}
+static void file_close(intptr_t h) { CloseHandle((HANDLE)h); }
+static void file_delete(const char *path) { DeleteFileA(path); }
+#else
+static int tmp_make(char *path, size_t cap) {
+    const char *dir = getenv("TMPDIR");
+    return snprintf(path, cap, "%s/tvkXXXXXX", dir && *dir ? dir : "/tmp") < (int)cap && mkstemp(path) >= 0;
+}
+static int tmp_write(const char *path, const uint8_t *data, size_t n) { return plat_file_write(path, data, n); }
+static intptr_t file_open(const char *path, int unbuffered) {
+    int fd = open(path, O_RDONLY | (unbuffered ? O_DIRECT : 0));
+    return fd < 0 ? -1 : fd;
+}
+static long file_read(intptr_t h, void *buf, size_t n) { return (long)read((int)h, buf, n); }
+static void file_close(intptr_t h) { close((int)h); }
+static void file_delete(const char *path) { plat_file_delete(path); }
+#endif
+
+// ReadFile into a watched page, buffered and unbuffered: timed, and whether write watch saw the kernel's write.
+static int test_readfile(uint8_t *dst) {
+    char path[4096];
+    GCHECK(tmp_make(path, sizeof path), "temp file name");
+    static uint8_t data[0x2000];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = rnd8();
+    GCHECK(tmp_write(path, data, sizeof data), "temp file write");
     for (int k = 0; k < 2; k++) {
         uint8_t *p = dst + (size_t)k * 0x2000;
         uint64_t pages[8];
-        h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, k ? FILE_FLAG_NO_BUFFERING : 0, NULL);
-        GCHECK(h != INVALID_HANDLE_VALUE, "temp file open");
+        intptr_t h = file_open(path, k);
+        GCHECK(h >= 0, "temp file open");
         mem_written_pages((uintptr_t)p, 0x2000, pages, 8);
-        QueryPerformanceCounter(&t0);
-        BOOL ok = ReadFile(h, p, 0x2000, &got, NULL);
-        QueryPerformanceCounter(&t1);
-        CloseHandle(h);
-        GCHECK(ok && got == 0x2000 && !memcmp(p, data, sizeof data), "ReadFile (%s) result", k ? "unbuffered" : "buffered");
+        uint64_t t0 = plat_now_ns();
+        long got = file_read(h, p, 0x2000);
+        uint64_t t1 = plat_now_ns();
+        file_close(h);
+        GCHECK(got == 0x2000 && !memcmp(p, data, sizeof data), "ReadFile (%s) result", k ? "unbuffered" : "buffered");
         g_rf_seen[k] = mem_written_pages((uintptr_t)p, 0x2000, pages, 8);
-        g_rf_us[k] = (uint64_t)((t1.QuadPart - t0.QuadPart) * 1000000 / f.QuadPart);
+        g_rf_us[k] = (t1 - t0) / 1000;
         printf("probe-vkmem: ReadFile %s of 8 KiB into a watched page: %llu us, write watch saw %llu of 2 pages\n",
                k ? "unbuffered" : "buffered", (unsigned long long)g_rf_us[k], (unsigned long long)g_rf_seen[k]);
     }
-    DeleteFileA(path);
+    file_delete(path);
     g_gpu_checks += 2;
     return 0;
 }

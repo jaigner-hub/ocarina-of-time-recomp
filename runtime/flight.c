@@ -10,10 +10,17 @@
 //
 // Records come from perf_present (prof_win.c) on the render thread; the counts are differences of the OOT_TRACE=perf
 // running totals and of vk_exec_frame. Off, the only cost is the flight_on branch in perf_present and vk_backend.c.
-#include <windows.h>
+#ifdef _WIN32
+#include <windows.h>   // the dump thread lowers its priority, which only Windows does here
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include "platform/platform.h"
+
+#define FLIGHT_PATH_MAX 4096
 
 #include "cfg.h"
 #include "flight.h"
@@ -44,7 +51,7 @@ typedef struct {
     int n;                      // records, oldest first
     uint64_t trig_frame, trig_interval_us;
     const char *why;
-    char dir[MAX_PATH];
+    char dir[FLIGHT_PATH_MAX];
     Rec r[];
 } DumpJob;
 
@@ -57,7 +64,7 @@ static uint64_t dump_at, trig_frame, trig_interval_us, last_spike_ns;
 static const char *trig_why;
 static uint64_t at_frames[16];
 static int n_at;
-static char base_dir[MAX_PATH];
+static char base_dir[FLIGHT_PATH_MAX];
 static uint64_t prev_cnt[PERF_CNT_N], prev_xlated;
 static VkExecFrame prev_exec;
 static volatile uint64_t cost_ns, cost_max_ns;   // render-thread time in flight_frame, for the dump log line
@@ -82,15 +89,22 @@ void flight_init(void) {
         p = *end == ',' ? end + 1 : end;
     }
     const char *d = cfg_get("OOT_FLIGHT_DIR");
-    char tmp[MAX_PATH];
+    char tmp[FLIGHT_PATH_MAX];
     if (d && *d) snprintf(tmp, sizeof tmp, "%s", d);
     else {   // <exe dir>/../flight: build/flight for build/v121*/oot.exe
-        DWORD k = GetModuleFileNameA(NULL, tmp, sizeof tmp);
-        char *slash = k ? strrchr(tmp, '\\') : NULL;
-        if (slash) snprintf(slash, sizeof tmp - (size_t)(slash - tmp), "\\..\\flight");
+        int k = plat_exe_path(tmp, sizeof tmp);
+        char *slash = k ? strrchr(tmp, '/') : NULL;
+        char *bslash = k ? strrchr(tmp, '\\') : NULL;
+        if (bslash && (!slash || bslash > slash)) slash = bslash;
+        if (slash) snprintf(slash, sizeof tmp - (size_t)(slash - tmp), "/../flight");
         else snprintf(tmp, sizeof tmp, "flight");
     }
+    // Absolute and without "..": GetFullPathNameA on Windows, realpath elsewhere; the path as given when that fails.
+#ifdef _WIN32
     if (!GetFullPathNameA(tmp, sizeof base_dir, base_dir, NULL)) snprintf(base_dir, sizeof base_dir, "%s", tmp);
+#else
+    if (!realpath(tmp, base_dir)) snprintf(base_dir, sizeof base_dir, "%s", tmp);
+#endif
     thumbs_on = env_u("OOT_FLIGHT_THUMBS", 1) != 0;
     if (thumbs_on) vk_thumbs_enable(ring_n);
     flight_on = 1;
@@ -228,16 +242,14 @@ static int write_png(const char *path, const uint8_t *rgba, PngBufs *pb) {
 }
 
 // ---------------------------------------------------------------- dump thread
-static DWORD WINAPI dump_main(void *arg) {
+static void dump_main(void *arg) {
     DumpJob *j = arg;
-    uint64_t t_start = GetTickCount64();
+    uint64_t t_start = plat_tick_ms();
+#ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-    CreateDirectoryA(base_dir, NULL);
-    if (!CreateDirectoryA(j->dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        rt_log("flight: cannot create %s (error %lu)", j->dir, GetLastError());
-        free(j);
-        return 0;
-    }
+#endif
+    plat_file_mkdir_p(j->dir);   // makes base_dir too; a directory that cannot be made fails the frames.tsv write below
+
     uint8_t *have = calloc((size_t)j->n, 1);
     int n_thumbs = 0;
     if (thumbs_on && have) {
@@ -253,23 +265,23 @@ static DWORD WINAPI dump_main(void *arg) {
         // Oldest first: each slot is copied out long before the presents that go on meanwhile reach it again. The newest
         // few complete only when their present fence has been waited for, so they get a second try.
         for (int pass = 0; pass < 2 && pb.raw && pb.z && pb.head && px; pass++) {
-            if (pass) Sleep(200);
+            if (pass) plat_sleep_ns(200000000ull);
             for (int i = pass ? (j->n > 8 ? j->n - 8 : 0) : 0; i < j->n; i++) {
                 if (have[i] || !vk_thumbs_read(j->r[i].frame, px)) continue;
-                char path[MAX_PATH + 32];
-                snprintf(path, sizeof path, "%s\\f%06llu.png", j->dir, (unsigned long long)j->r[i].frame);
+                char path[FLIGHT_PATH_MAX + 32];
+                snprintf(path, sizeof path, "%s/f%06llu.png", j->dir, (unsigned long long)j->r[i].frame);
                 if (write_png(path, px, &pb)) have[i] = 1, n_thumbs++;
             }
         }
         free(px), free(pb.raw), free(pb.z), free(pb.head);
     }
-    char path[MAX_PATH + 32];
-    snprintf(path, sizeof path, "%s\\frames.tsv", j->dir);
+    char path[FLIGHT_PATH_MAX + 32];
+    snprintf(path, sizeof path, "%s/frames.tsv", j->dir);
     FILE *f = fopen(path, "w");
     if (!f) {
         rt_log("flight: cannot write %s", path);
         free(have), free(j);
-        return 0;
+        return;
     }
     fprintf(f, "# oot flight dump: %s at frame %llu, interval %.1f ms\n", j->why, (unsigned long long)j->trig_frame,
             j->trig_interval_us / 1000.0);
@@ -288,11 +300,10 @@ static DWORD WINAPI dump_main(void *arg) {
     rt_log("flight: dump %s: %s at frame %llu (%.1f ms), frames %llu-%llu, %d thumbnails, written in %llu ms; "
            "recorder %.1f us per frame (max %.0f us)", j->dir,
            j->why, (unsigned long long)j->trig_frame, j->trig_interval_us / 1000.0, (unsigned long long)j->r[0].frame,
-           (unsigned long long)j->r[j->n - 1].frame, n_thumbs, (unsigned long long)(GetTickCount64() - t_start),
+           (unsigned long long)j->r[j->n - 1].frame, n_thumbs, (unsigned long long)(plat_tick_ms() - t_start),
            recorded ? cost_ns / 1e3 / (double)recorded : 0.0, cost_max_ns / 1e3);
     free(have);
     free(j);
-    return 0;
 }
 
 static void start_dump(void) {
@@ -304,13 +315,15 @@ static void start_dump(void) {
     j->trig_interval_us = trig_interval_us;
     j->why = trig_why;
     for (int i = 0; i < n; i++) j->r[i] = ring[(recorded - (uint64_t)n + (uint64_t)i) % (uint64_t)ring_n];
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    snprintf(j->dir, sizeof j->dir, "%s\\%04u%02u%02u-%02u%02u%02u-f%llu", base_dir, st.wYear, st.wMonth, st.wDay, st.wHour,
-             st.wMinute, st.wSecond, (unsigned long long)trig_frame);
-    HANDLE h = CreateThread(NULL, 0, dump_main, j, 0, NULL);
-    if (h) CloseHandle(h);
-    else rt_log("flight: cannot start the dump thread (error %lu)", GetLastError()), free(j);
+    time_t now = time(NULL);
+    struct tm st;
+    localtime_r(&now, &st);
+    snprintf(j->dir, sizeof j->dir, "%s/%04u%02u%02u-%02u%02u%02u-f%llu", base_dir, (unsigned)st.tm_year + 1900u,
+             (unsigned)st.tm_mon + 1u, (unsigned)st.tm_mday, (unsigned)st.tm_hour, (unsigned)st.tm_min,
+             (unsigned)st.tm_sec, (unsigned long long)trig_frame);
+    PlatThread *h = plat_thread_new(dump_main, j, "flight dump");
+    if (h) plat_thread_detach(h);
+    else rt_log("flight: cannot start the dump thread (error %lu)", (unsigned long)plat_last_error()), free(j);
 }
 
 static void trigger(uint64_t frame, uint64_t interval_ns, const char *why) {
@@ -353,11 +366,15 @@ void flight_frame(uint64_t frame, uint64_t now_ns, uint64_t interval_ns, const u
     }
     recorded++;
 
+#ifdef _WIN32
+    // F8 dumps while the game window is in front. Linux has no F8 trigger yet: input_sdl.c keeps the F8 state
+    // but exports no accessor for it; OOT_FLIGHT_AT and the spike trigger work everywhere.
     static int key_was;
     HWND w = gfx_window_handle();
     int key = w && w == GetForegroundWindow() && (GetAsyncKeyState(VK_F8) & 0x8000);
     if (key && !key_was) trigger(frame, interval_ns, "F8");
     key_was = key;
+#endif
     for (int i = 0; i < n_at; i++)
         if (at_frames[i] == frame) trigger(frame, interval_ns, "OOT_FLIGHT_AT");
     if (spike_ns && interval_ns > spike_ns && recorded > 30 && (!last_spike_ns || now_ns - last_spike_ns >= FLIGHT_SPIKE_GAP_NS)) {

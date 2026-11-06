@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "platform/platform.h"
 
 #include "host.h"
 #include "tex.h"
@@ -115,11 +115,7 @@ static void to_general(VkCommandBuffer cb, VkImage img) {
     vkCmdPipelineBarrier2(cb, &di);
 }
 
-static double now_ms(void) {
-    LARGE_INTEGER t, f;
-    QueryPerformanceCounter(&t), QueryPerformanceFrequency(&f);
-    return (double)t.QuadPart * 1e3 / (double)f.QuadPart;
-}
+static double now_ms(void) { return (double)plat_now_ns() / 1e6; }
 
 // Decodes regions (w0 x h0 at level 0, w1 x h1 at level 1) of blk on the GPU; out_rb: the decoder's texels, out_img:
 // the image's two levels read back. 0 on a Vulkan failure.
@@ -362,7 +358,7 @@ static void timing(VkCtx *c, uint32_t bw, uint32_t bh) {
 }
 
 int probe_astc(void) {
-    _putenv_s("OOT_ASTC_BC", "1");   // also builds the BC3 encoder; the RGBA8 cases pass bc 0 and do not use it
+    plat_setenv("OOT_ASTC_BC", "1");   // also builds the BC3 encoder; the RGBA8 cases pass bc 0 and do not use it
     if (!vk_init()) { printf("probe-astc: FAIL vk_init\n"); return 1; }
     VkCtx *c = vk_ctx();
     printf("probe-astc: GPU %s, textureCompressionASTC_LDR %d, mode %d\n", c->props.deviceName, c->has_astc_ldr,

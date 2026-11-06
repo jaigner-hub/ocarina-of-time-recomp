@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <windows.h>
 #include <pdh.h>
+#include <bcrypt.h>
 #include <pdhmsg.h>
 #include <psapi.h>
 #include <shellapi.h>
@@ -60,8 +61,274 @@ void plat_thread_detach(PlatThread *t) {
     t->h = NULL;
 }
 
+// From totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_thread_new_ex,
+// plat_thread_spawn); kernel.c's CreateThread with a reserved stack, moved here.
+PlatThread *plat_thread_new_ex(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = calloc(1, sizeof *t);
+    if (!t) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+    t->h = CreateThread(NULL, stack ? stack : PLAT_STACK_DEFAULT, thread_main, t,
+                        CREATE_SUSPENDED | STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (!t->h) { free(t); return NULL; }
+    if (name) {
+        wchar_t w[64];
+        if (MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) SetThreadDescription(t->h, w);
+    }
+    ResumeThread(t->h);
+    return t;
+}
+
+int plat_thread_spawn(PlatThreadFn fn, void *arg, const char *name, size_t stack) {
+    PlatThread *t = plat_thread_new_ex(fn, arg, name, stack);
+    if (t) plat_thread_detach(t);
+    return t != NULL;
+}
+
+uint64_t plat_thread_cpu_ns(uint32_t tid) {
+    HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+    FILETIME a, b, k, u;
+    uint64_t ns = 0;
+    if (th && GetThreadTimes(th, &a, &b, &k, &u))
+        ns = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime)) *
+             100;
+    if (th) CloseHandle(th);
+    return ns;
+}
+
+// kernel.c's host_stack for the thread dump (OOT_THREAD_DUMP), moved here: suspended, the thread's context is read and
+// unwound with ntdll's unwinder (no dbghelp, so no loader lock while it is suspended; a leaf frame without unwind data
+// pops its return address).
+int plat_stack_walk(uint32_t tid, uint64_t *frames, int max) {
+    if (!tid || tid == plat_thread_id()) return 0;
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+    if (!h) return 0;
+    int n = 0;
+    if (SuspendThread(h) != (DWORD)-1) {
+        CONTEXT ctx;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(h, &ctx)) {
+            for (; n < max && ctx.Rip; ) {
+                frames[n++] = ctx.Rip;
+                DWORD64 base = 0;
+                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                if (!fn) {
+                    if (IsBadReadPtr((const void *)(uintptr_t)ctx.Rsp, 8)) break;
+                    ctx.Rip = *(const DWORD64 *)(uintptr_t)ctx.Rsp;
+                    ctx.Rsp += 8;
+                } else {
+                    PVOID handler = NULL;
+                    DWORD64 est = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &handler, &est, NULL);
+                }
+            }
+        }
+        ResumeThread(h);
+    }
+    CloseHandle(h);
+    return n;
+}
+
+
+// ---- thread interruption: SuspendThread, Get/SetThreadContext, ResumeThread (kernel.c's ap_try, moved here; the
+// structure is totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1).
+struct PlatIntr {
+    CONTEXT ctx;   // first: CONTEXT wants 16-byte alignment
+    HANDLE h;
+};
+
+PlatIntr *plat_intr_self(void) {
+    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
+                          FALSE, GetCurrentThreadId());
+    PlatIntr *t = h ? _aligned_malloc(sizeof *t, 16) : NULL;
+    if (!t) {
+        if (h) CloseHandle(h);
+        return NULL;
+    }
+    t->h = h;
+    return t;
+}
+
+void plat_intr_free(PlatIntr *t) {
+    if (!t) return;
+    CloseHandle(t->h);
+    _aligned_free(t);
+}
+
+int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp) {
+    if (SuspendThread(t->h) == (DWORD)-1) return 0;
+    memset(&t->ctx, 0, sizeof t->ctx);
+    t->ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;   // set back whole, so the kernel restores every GPR
+    if (!GetThreadContext(t->h, &t->ctx)) {
+        ResumeThread(t->h);
+        return 0;
+    }
+    *rip = t->ctx.Rip;
+    *rsp = t->ctx.Rsp;
+    return 1;
+}
+
+int plat_intr_resume(PlatIntr *t, uint64_t to) {
+    int ok = 1;
+    if (to) {
+        t->ctx.Rip = to;
+        ok = SetThreadContext(t->h, &t->ctx) != 0;
+    }
+    ResumeThread(t->h);
+    return ok;
+}
+
+// ---- fibers: Windows fibers with FIBER_FLAG_FLOAT_SWITCH (the MXCSR and x87 control word switch with them).
+// From totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1 (plat_fiber_*); kernel.c's
+// CreateFiberEx with the 64 KiB commit and its ConvertThreadToFiberEx, moved here.
+struct PlatFiber {
+    void *h;
+    void (*fn)(void *arg);
+    void *arg;
+};
+
+static __thread PlatFiber self_fiber;
+
+PlatFiber *plat_fiber_self(void) {
+    self_fiber.h = ConvertThreadToFiberEx(NULL, FIBER_FLAG_FLOAT_SWITCH);
+    return self_fiber.h ? &self_fiber : NULL;
+}
+
+void plat_fiber_unself(void) {
+    ConvertFiberToThread();
+    self_fiber.h = NULL;
+}
+
+static void WINAPI fiber_start(void *p) {
+    PlatFiber *f = p;
+    f->fn(f->arg);
+}
+
+PlatFiber *plat_fiber_new(size_t stack, void (*fn)(void *arg), void *arg) {
+    PlatFiber *f = malloc(sizeof *f);
+    if (!f) return NULL;
+    f->fn = fn, f->arg = arg;
+    f->h = CreateFiberEx(0x10000, stack, FIBER_FLAG_FLOAT_SWITCH, fiber_start, f);
+    if (!f->h) {
+        free(f);
+        return NULL;
+    }
+    return f;
+}
+
+void plat_fiber_switch(PlatFiber *to) { SwitchToFiber(to->h); }
+
+void plat_fiber_free(PlatFiber *f) {
+    if (!f) return;
+    DeleteFiber(f->h);
+    free(f);
+}
+
+// plat_jmp_save / plat_jmp_go: PlatJmp holds rbx, rbp, rdi, rsi, r12-r15, the caller's rsp and the return address at
+// 0..72, MXCSR at 80, the x87 control word at 84 and xmm6-xmm15 from 96, the Win64 callee-saved state. Both are leaf
+// code that does not move rsp before it leaves, so they need no unwind data. Copied from totk-pc-recomp
+// runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1; they replace kernel.c's non-SEH setjmp and
+// longjmp (__USE_MINGW_SETJMP_NON_SEH), whose buffer the C runtime's longjmp can refuse under Control Flow Guard.
+_Static_assert(sizeof(PlatJmp) == 256 && __builtin_offsetof(PlatJmp, xmm) == 96, "plat_jmp_save layout");
+__asm__(".text\n"
+        ".globl plat_jmp_save\n"
+        ".def plat_jmp_save; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "plat_jmp_save:\n"
+        "    movq %rbx, 0(%rcx)\n"
+        "    movq %rbp, 8(%rcx)\n"
+        "    movq %rdi, 16(%rcx)\n"
+        "    movq %rsi, 24(%rcx)\n"
+        "    movq %r12, 32(%rcx)\n"
+        "    movq %r13, 40(%rcx)\n"
+        "    movq %r14, 48(%rcx)\n"
+        "    movq %r15, 56(%rcx)\n"
+        "    leaq 8(%rsp), %rdx\n"   // the caller's rsp after this call returns
+        "    movq %rdx, 64(%rcx)\n"
+        "    movq (%rsp), %rdx\n"
+        "    movq %rdx, 72(%rcx)\n"
+        "    stmxcsr 80(%rcx)\n"
+        "    fnstcw 84(%rcx)\n"
+        "    movdqu %xmm6, 96(%rcx)\n"
+        "    movdqu %xmm7, 112(%rcx)\n"
+        "    movdqu %xmm8, 128(%rcx)\n"
+        "    movdqu %xmm9, 144(%rcx)\n"
+        "    movdqu %xmm10, 160(%rcx)\n"
+        "    movdqu %xmm11, 176(%rcx)\n"
+        "    movdqu %xmm12, 192(%rcx)\n"
+        "    movdqu %xmm13, 208(%rcx)\n"
+        "    movdqu %xmm14, 224(%rcx)\n"
+        "    movdqu %xmm15, 240(%rcx)\n"
+        "    xorl %eax, %eax\n"
+        "    ret\n"
+        ".globl plat_jmp_go\n"
+        ".def plat_jmp_go; .scl 2; .type 32; .endef\n"
+        ".p2align 4\n"
+        "plat_jmp_go:\n"
+        "    movq 0(%rcx), %rbx\n"
+        "    movq 8(%rcx), %rbp\n"
+        "    movq 16(%rcx), %rdi\n"
+        "    movq 24(%rcx), %rsi\n"
+        "    movq 32(%rcx), %r12\n"
+        "    movq 40(%rcx), %r13\n"
+        "    movq 48(%rcx), %r14\n"
+        "    movq 56(%rcx), %r15\n"
+        "    ldmxcsr 80(%rcx)\n"
+        "    fldcw 84(%rcx)\n"
+        "    movdqu 96(%rcx), %xmm6\n"
+        "    movdqu 112(%rcx), %xmm7\n"
+        "    movdqu 128(%rcx), %xmm8\n"
+        "    movdqu 144(%rcx), %xmm9\n"
+        "    movdqu 160(%rcx), %xmm10\n"
+        "    movdqu 176(%rcx), %xmm11\n"
+        "    movdqu 192(%rcx), %xmm12\n"
+        "    movdqu 208(%rcx), %xmm13\n"
+        "    movdqu 224(%rcx), %xmm14\n"
+        "    movdqu 240(%rcx), %xmm15\n"
+        "    movq 64(%rcx), %rsp\n"
+        "    movl $1, %eax\n"
+        "    jmpq *72(%rcx)\n");
+
 uint64_t plat_thread_affinity(PlatThread *t, uint64_t mask) {
     return (uint64_t)SetThreadAffinityMask(t ? t->h : GetCurrentThread(), (DWORD_PTR)mask);
+}
+
+// ---- auto-reset events
+struct PlatEvent {
+    HANDLE h;
+};
+
+PlatEvent *plat_event_new(void) {
+    PlatEvent *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    e->h = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!e->h) {
+        free(e);
+        return NULL;
+    }
+    return e;
+}
+
+void plat_event_free(PlatEvent *e) {
+    if (!e) return;
+    CloseHandle(e->h);
+    free(e);
+}
+
+void plat_event_set(PlatEvent *e) { if (e) SetEvent(e->h); }   // as SetEvent(NULL) did before the events became PlatEvent
+
+int plat_event_wait_ns(PlatEvent *e, uint64_t ns) {
+    uint64_t ms = (ns + 999999) / 1000000;
+    DWORD wait = ns == UINT64_MAX || ms >= INFINITE ? INFINITE : (DWORD)ms;
+    return WaitForSingleObject(e->h, wait) == WAIT_OBJECT_0;
+}
+
+void plat_yield(void) { SwitchToThread(); }
+
+void plat_thread_priority(PlatThread *t, int level) {
+    static const int map[] = {THREAD_PRIORITY_IDLE, THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_NORMAL};
+    if ((unsigned)level < 3) SetThreadPriority(t ? t->h : GetCurrentThread(), map[level]);
 }
 
 uint32_t plat_cpu_count(void) {
@@ -99,6 +366,23 @@ uint64_t plat_now_ns(void) {
 static __thread HANDLE sleep_timer;
 static __thread int sleep_timer_tried;
 
+// A waitable timer per thread, kept until exit: the high-resolution kind (Windows 10 1803+), else a plain one. kernel.c's
+// SleepThread used the same, one handle per guest thread, closed when the thread ended.
+static __thread HANDLE wait_timer;
+
+void plat_wait_ns(uint64_t ns) {
+    if (!wait_timer) {
+        wait_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!wait_timer) wait_timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+    }
+    LARGE_INTEGER due;
+    uint64_t units = ns / 100 + (ns % 100 != 0);   // 100 ns units, rounded up
+    due.QuadPart = -(LONGLONG)(units > 0 ? units : 1);
+    if (wait_timer && SetWaitableTimer(wait_timer, &due, 0, NULL, NULL, FALSE))
+        WaitForSingleObject(wait_timer, INFINITE);
+    else Sleep((DWORD)((ns + 999999) / 1000000));
+}
+
 void plat_sleep_ns(uint64_t ns) {
     uint64_t end = plat_now_ns() + ns;
     if (!sleep_timer_tried) {
@@ -123,6 +407,8 @@ void plat_mutex_init(PlatMutex *m) { InitializeSRWLock((PSRWLOCK)m); }
 void plat_mutex_lock(PlatMutex *m) { AcquireSRWLockExclusive((PSRWLOCK)m); }
 int plat_mutex_trylock(PlatMutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) != 0; }
 void plat_mutex_unlock(PlatMutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
+void plat_mutex_lock_shared(PlatMutex *m) { AcquireSRWLockShared((PSRWLOCK)m); }
+void plat_mutex_unlock_shared(PlatMutex *m) { ReleaseSRWLockShared((PSRWLOCK)m); }
 
 void plat_cond_init(PlatCond *c) { InitializeConditionVariable((PCONDITION_VARIABLE)c); }
 void plat_cond_wait(PlatCond *c, PlatMutex *m) { SleepConditionVariableSRW((PCONDITION_VARIABLE)c, (PSRWLOCK)m, INFINITE, 0); }
@@ -295,13 +581,124 @@ int plat_file_list(const char *dir, const char *ext, int (*cb)(const char *name,
     return 1;
 }
 
+uint64_t plat_tick_ms(void) { return GetTickCount64(); }
+
+uint32_t plat_last_error(void) { return (uint32_t)GetLastError(); }
+
+int plat_setenv(const char *name, const char *value) { return SetEnvironmentVariableA(name, value) != 0; }
+
+// Creates the same command line in a new process, waits for it and exits with its code (the code of the parent
+// memory.c's reexec_or_fail used before this layer existed).
+int plat_reexec(uint32_t *err) {
+    STARTUPINFOW si = {.cb = sizeof si};
+    PROCESS_INFORMATION pi;
+    wchar_t *cmd = _wcsdup(GetCommandLineW());   // CreateProcessW may write its command line
+    if (!cmd || !CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        if (err) *err = (uint32_t)GetLastError();
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 70;
+    GetExitCodeProcess(pi.hProcess, &code);
+    ExitProcess(code);
+}
+
+int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
+    void *p = VirtualAlloc((void *)(uintptr_t)addr, n, MEM_RESERVE | (watch ? MEM_WRITE_WATCH : 0), PAGE_NOACCESS);
+    if (p && p != (void *)(uintptr_t)addr) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        p = NULL;
+    }
+    return p != NULL;
+}
+
+void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }
+
 int plat_mem_commit(uint64_t addr, size_t n) {
     return VirtualAlloc((void *)(uintptr_t)addr, n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+}
+
+int plat_mem_decommit(uint64_t addr, uint64_t n) {
+    return VirtualFree((void *)(uintptr_t)addr, n, MEM_DECOMMIT) != 0;
+}
+
+static DWORD win_prot(int prot) {
+    return prot == PLAT_PROT_RW ? PAGE_READWRITE : prot == PLAT_PROT_READ ? PAGE_READONLY : PAGE_NOACCESS;
+}
+
+int plat_mem_protect(uint64_t addr, uint64_t n, int prot) {
+    DWORD old;
+    return VirtualProtect((void *)(uintptr_t)addr, n, win_prot(prot), &old) != 0;
+}
+
+void plat_mem_release(uint64_t addr, uint64_t n) {
+    (void)n;   // VirtualFree with MEM_RELEASE takes the base address and frees the whole reservation
+    VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE);
+}
+
+int plat_mem_state(uint64_t addr, uint64_t limit, uint64_t *end) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!VirtualQuery((void *)(uintptr_t)addr, &mbi, sizeof mbi)) {
+        *end = limit;
+        return PLAT_MEM_FREE;
+    }
+    uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    *end = b < limit ? b : limit;
+    if (mbi.State == MEM_FREE) return PLAT_MEM_FREE;
+    if (mbi.State == MEM_RESERVE) return PLAT_MEM_RESERVED;
+    if (mbi.Protect == PAGE_NOACCESS) return PLAT_PROT_NONE;
+    if (mbi.Protect == PAGE_READONLY) return PLAT_PROT_READ;
+    if (mbi.Protect == PAGE_READWRITE) return PLAT_PROT_RW;
+    return PLAT_MEM_OTHER;
+}
+
+uint64_t plat_mem_written(uint64_t addr, uint64_t n, uint64_t *pages, uint64_t max, int reset) {
+    ULONG_PTR cnt = (ULONG_PTR)max;
+    DWORD gran;
+    _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
+    if (GetWriteWatch(reset ? WRITE_WATCH_FLAG_RESET : 0, (void *)(uintptr_t)addr, (SIZE_T)n, (PVOID *)pages, &cnt, &gran))
+        return UINT64_MAX;
+    return cnt;
+}
+
+static int (*fault_hook)(uint64_t addr);
+
+// A write access violation at a page goes to the hook first; the hook made the page writable when it returns 1.
+static LONG CALLBACK fault_handler(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    return fault_hook && fault_hook((uint64_t)er->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                           : EXCEPTION_CONTINUE_SEARCH;
+}
+
+void plat_mem_fault_hook(int (*fn)(uint64_t addr)) {
+    fault_hook = fn;
+    AddVectoredExceptionHandler(1, fault_handler);   // before the crash handler
 }
 
 int plat_mem_read(uint64_t addr, void *out, size_t n) {
     SIZE_T got = 0;
     return ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)addr, out, n, &got) && got == n;
+}
+
+void *plat_aligned_alloc(size_t size, size_t align) { return _aligned_malloc(size, align); }
+void plat_aligned_free(void *p) { _aligned_free(p); }
+
+// From totk-pc-recomp runtime/platform/win32.c @ 0ae47a578285cde080642c9e6c40316c99171ef1.
+uintptr_t plat_exe_base(void) { return (uintptr_t)GetModuleHandleW(NULL); }
+
+int plat_module_of(uintptr_t addr, char *name, size_t cap, uintptr_t *base) {
+    HMODULE m = NULL;
+    wchar_t w[WPATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)addr, &m) ||
+        !m || !GetModuleFileNameW(m, w, WPATH))
+        return 0;
+    const wchar_t *n = wcsrchr(w, L'\\') ? wcsrchr(w, L'\\') + 1 : w;
+    *base = (uintptr_t)m;
+    return WideCharToMultiByte(CP_UTF8, 0, n, -1, name, (int)cap, NULL, NULL) != 0;
 }
 
 int plat_exe_path(char *out, size_t cap) {
@@ -696,4 +1093,302 @@ long plat_child_read(PlatChild *c, void *buf, size_t cap) {
     DWORD got = 0;
     if (!ReadFile(c->out, buf, (DWORD)cap, &got, NULL)) return -1;
     return (long)got;
+}
+
+int plat_random(void *out, size_t n) {
+    return BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+}
+
+// SHA-256 through the system's BCrypt provider; the algorithm handle is opened once and kept (moved from main.c).
+int plat_sha256(const void *p, size_t n, uint8_t out[32]) {
+    static BCRYPT_ALG_HANDLE alg;
+    BCRYPT_ALG_HANDLE a = __atomic_load_n(&alg, __ATOMIC_ACQUIRE);
+    if (!a) {
+        if (BCryptOpenAlgorithmProvider(&a, BCRYPT_SHA256_ALGORITHM, NULL, 0)) return 0;
+        BCRYPT_ALG_HANDLE expected = NULL;
+        if (!__atomic_compare_exchange_n(&alg, &expected, a, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            BCryptCloseAlgorithmProvider(a, 0);
+            a = expected;
+        }
+    }
+    BCRYPT_HASH_HANDLE h;
+    if (BCryptCreateHash(a, &h, NULL, 0, NULL, 0, 0)) return 0;
+    const uint8_t *s = p;
+    while (n) {
+        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
+        if (BCryptHashData(h, (PUCHAR)s, k, 0)) {
+            BCryptDestroyHash(h);
+            return 0;
+        }
+        s += k;
+        n -= k;
+    }
+    int ok = BCryptFinishHash(h, out, 32, 0) == 0;
+    BCryptDestroyHash(h);
+    return ok;
+}
+
+// The streamed form (moved from romfs.c, where the RomFS hashes its 17 GB image in pieces): a BCrypt hash handle with
+// the algorithm handle opened for it; end closes both.
+struct PlatSha256 {
+    BCRYPT_ALG_HANDLE alg;
+    BCRYPT_HASH_HANDLE h;
+};
+
+PlatSha256 *plat_sha256_begin(void) {
+    PlatSha256 *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    if (BCryptOpenAlgorithmProvider(&s->alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) ||
+        BCryptCreateHash(s->alg, &s->h, NULL, 0, NULL, 0, 0)) {
+        if (s->alg) BCryptCloseAlgorithmProvider(s->alg, 0);
+        free(s);
+        return NULL;
+    }
+    return s;
+}
+
+int plat_sha256_update(PlatSha256 *s, const void *p, size_t n) {
+    const uint8_t *q = p;
+    while (n) {
+        ULONG k = n > 0x40000000 ? 0x40000000 : (ULONG)n;
+        if (BCryptHashData(s->h, (PUCHAR)q, k, 0)) return 0;
+        q += k;
+        n -= k;
+    }
+    return 1;
+}
+
+int plat_sha256_end(PlatSha256 *s, uint8_t out[32]) {
+    int ok = BCryptFinishHash(s->h, out, 32, 0) == 0;
+    BCryptDestroyHash(s->h);
+    BCryptCloseAlgorithmProvider(s->alg, 0);
+    free(s);
+    return ok;
+}
+
+// ---- files and the host file system under the save data (fs_host.c; declared in platform.h). The Win32 calls that
+// fs_host.c made before the platform layer existed, moved here with the same flags: every file is opened with all
+// three share modes, a save file is flushed with FlushFileBuffers, and a rename into place is MoveFileEx with
+// MOVEFILE_WRITE_THROUGH when durable.
+#include <time.h>
+
+static wchar_t *fs_w(const char *s) {
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, NULL, 0);
+    wchar_t *w = n > 0 ? malloc((size_t)n * sizeof *w) : NULL;
+    if (w && !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n)) free(w), w = NULL;
+    if (!w) SetLastError(ERROR_INVALID_NAME);
+    return w;
+}
+
+// The reasons fs_host.c tells apart, from a Win32 error code. Access denied and sharing violations are BUSY: a save
+// commit retries those, and the other callers report them as invalid arguments.
+static int fs_win_err(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_DIRECTORY: return PLAT_FS_NOT_FOUND;
+    case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: return PLAT_FS_EXISTS;
+    case ERROR_DIR_NOT_EMPTY: return PLAT_FS_NOT_EMPTY;
+    case ERROR_ACCESS_DENIED: case ERROR_SHARING_VIOLATION: return PLAT_FS_BUSY;
+    default: return PLAT_FS_ERROR;
+    }
+}
+
+int plat_fs_os_error(void) { return (int)GetLastError(); }
+
+int plat_fs_kind(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_MISSING;
+    DWORD a = GetFileAttributesW(w);
+    free(w);
+    if (a == INVALID_FILE_ATTRIBUTES) return PLAT_FS_MISSING;
+    if (a & FILE_ATTRIBUTE_REPARSE_POINT) return PLAT_FS_LINK;
+    return a & FILE_ATTRIBUTE_DIRECTORY ? PLAT_FS_DIR : PLAT_FS_FILE;
+}
+
+int plat_fs_mkdir(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_ERROR;
+    int r = CreateDirectoryW(w, NULL) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(w);
+    return r;
+}
+
+int plat_fs_rmdir(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_ERROR;
+    int r = RemoveDirectoryW(w) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(w);
+    return r;
+}
+
+int plat_fs_unlink(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return PLAT_FS_ERROR;
+    int r = DeleteFileW(w) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(w);
+    return r;
+}
+
+int plat_fs_rename(const char *from, const char *to, int durable) {
+    wchar_t *a = fs_w(from), *b = fs_w(to);
+    int r = PLAT_FS_ERROR;
+    if (a && b) r = MoveFileExW(a, b, durable ? MOVEFILE_WRITE_THROUGH : 0) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(a);
+    free(b);
+    return r;
+}
+
+// CreateHardLink names the new link first.
+int plat_fs_link(const char *existing, const char *path) {
+    wchar_t *a = fs_w(existing), *b = fs_w(path);
+    int r = PLAT_FS_ERROR;
+    if (a && b) r = CreateHardLinkW(b, a, NULL) ? PLAT_FS_OK : fs_win_err(GetLastError());
+    free(a);
+    free(b);
+    return r;
+}
+
+int plat_fs_links(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return 0;
+    HANDLE f = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    BY_HANDLE_FILE_INFORMATION fi;
+    int links = f != INVALID_HANDLE_VALUE && GetFileInformationByHandle(f, &fi) ? (int)fi.nNumberOfLinks : 0;
+    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    return links;
+}
+
+void plat_fs_sync_dir(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return;
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (h != INVALID_HANDLE_VALUE) {
+        FlushFileBuffers(h);
+        CloseHandle(h);
+    }
+}
+
+int plat_fs_list(const char *dir, int (*cb)(const char *name, int kind, uint64_t size, void *ctx), void *ctx) {
+    size_t n = strlen(dir);
+    char *pattern = malloc(n + 3);
+    if (!pattern) return PLAT_FS_ERROR;
+    memcpy(pattern, dir, n);
+    memcpy(pattern + n, "/*", 3);
+    wchar_t *w = fs_w(pattern);
+    free(pattern);
+    if (!w) return PLAT_FS_ERROR;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW(w, &fd);
+    free(w);
+    if (f == INVALID_HANDLE_VALUE) return fs_win_err(GetLastError());
+    int r = PLAT_FS_OK;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        char name[1024];
+        if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, sizeof name, NULL, NULL)) continue;
+        int kind = fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT ? PLAT_FS_LINK
+                   : fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ? PLAT_FS_DIR : PLAT_FS_FILE;
+        uint64_t size = kind == PLAT_FS_FILE ? (uint64_t)fd.nFileSizeHigh << 32 | fd.nFileSizeLow : 0;
+        if (!cb(name, kind, size, ctx)) break;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return r;
+}
+
+// A file is opened with all three share modes, so another process (a virus scanner, the save copy) may read it.
+static PlatFile *file_of_handle(HANDLE h, int *err) {
+    if (h != INVALID_HANDLE_VALUE) return (PlatFile *)h;
+    if (err) *err = fs_win_err(GetLastError());
+    return NULL;
+}
+
+PlatFile *plat_fs_open(const char *path, int write, int *err) {
+    wchar_t *w = fs_w(path);
+    if (!w) {
+        if (err) *err = PLAT_FS_ERROR;
+        return NULL;
+    }
+    HANDLE h = CreateFileW(w, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    return file_of_handle(h, err);
+}
+
+PlatFile *plat_fs_create(const char *path, int *err) {
+    wchar_t *w = fs_w(path);
+    if (!w) {
+        if (err) *err = PLAT_FS_ERROR;
+        return NULL;
+    }
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    return file_of_handle(h, err);
+}
+
+PlatFile *plat_file_open(const char *path) {
+    wchar_t *w = fs_w(path);
+    if (!w) return NULL;
+    HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(w);
+    return file_of_handle(h, NULL);
+}
+
+void plat_file_close(PlatFile *f) {
+    if (f) CloseHandle((HANDLE)f);
+}
+
+// Positional I/O on a synchronous handle: ReadFile and WriteFile with an OVERLAPPED offset.
+int64_t plat_file_pread(PlatFile *f, void *buf, uint32_t n, uint64_t off) {
+    OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
+    DWORD got = 0;
+    if (ReadFile((HANDLE)f, buf, n, &got, &ov)) return got;
+    DWORD e = GetLastError();
+    if (e == ERROR_HANDLE_EOF) return 0;
+    return e == ERROR_NOACCESS ? -2 : -1;   // a read-only page in the buffer
+}
+
+int64_t plat_file_pwrite(PlatFile *f, const void *buf, uint32_t n, uint64_t off) {
+    OVERLAPPED ov = {.Offset = (DWORD)off, .OffsetHigh = (DWORD)(off >> 32)};
+    DWORD put = 0;
+    return WriteFile((HANDLE)f, buf, n, &put, &ov) ? (int64_t)put : -1;
+}
+
+int plat_file_id(PlatFile *f, PlatFileId *out) {
+    BY_HANDLE_FILE_INFORMATION i;
+    if (!GetFileInformationByHandle((HANDLE)f, &i)) return 0;
+    *out = (PlatFileId){i.dwVolumeSerialNumber,
+                        (uint64_t)i.nFileIndexHigh << 32 | i.nFileIndexLow,
+                        (uint64_t)i.nFileSizeHigh << 32 | i.nFileSizeLow,
+                        (uint64_t)i.ftLastWriteTime.dwHighDateTime << 32 | i.ftLastWriteTime.dwLowDateTime,
+                        (uint64_t)i.ftCreationTime.dwHighDateTime << 32 | i.ftCreationTime.dwLowDateTime};
+    return 1;
+}
+
+int plat_file_set_size(PlatFile *f, uint64_t size) {
+    FILE_END_OF_FILE_INFO eof = {.EndOfFile.QuadPart = (LONGLONG)size};
+    return SetFileInformationByHandle((HANDLE)f, FileEndOfFileInfo, &eof, sizeof eof) ? PLAT_FS_OK
+                                                                                      : fs_win_err(GetLastError());
+}
+
+int plat_file_fsync(PlatFile *f) { return FlushFileBuffers((HANDLE)f) != 0; }
+
+int plat_temp_dir(char *out, size_t cap) {
+    wchar_t tmpw[MAX_PATH + 1];
+    DWORD n = GetTempPathW(MAX_PATH + 1, tmpw);
+    if (!n || n > MAX_PATH) return 0;
+    char tmp[MAX_PATH * 3];
+    if (!WideCharToMultiByte(CP_UTF8, 0, tmpw, -1, tmp, sizeof tmp, NULL, NULL)) return 0;
+    size_t k = strlen(tmp);
+    while (k > 0 && (tmp[k - 1] == '\\' || tmp[k - 1] == '/')) tmp[--k] = 0;
+    return snprintf(out, cap, "%s", tmp) < (int)cap;
+}
+
+void plat_utc_now(struct tm *out, unsigned *ms) {
+    SYSTEMTIME t;
+    GetSystemTime(&t);
+    *out = (struct tm){.tm_year = t.wYear - 1900, .tm_mon = t.wMonth - 1, .tm_mday = t.wDay, .tm_hour = t.wHour,
+                       .tm_min = t.wMinute, .tm_sec = t.wSecond, .tm_wday = t.wDayOfWeek};
+    *ms = t.wMilliseconds;
 }

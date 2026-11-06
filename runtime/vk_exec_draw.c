@@ -26,6 +26,7 @@
 
 #include "cfg.h"
 #include "host.h"
+#include "platform/platform.h"
 #include "nvn_api.h"
 #include "tex.h"
 #include "nvn_hmap.h"
@@ -90,7 +91,7 @@ static uint64_t cur_fence;
 // allocation, a map and a paging-fence wait on the CPU), about ten of them per frame inside the replay.
 #define SPARE_POOLS 64
 #define SPARE_CHUNKS 16
-static SRWLOCK spare_lock = SRWLOCK_INIT;
+static PlatMutex spare_lock = PLAT_MUTEX_INIT;
 static VkDescriptorPool spare_pool[SPARE_POOLS];
 static Chunk spare_chunk[SPARE_CHUNKS];
 static int nspare_pool, nspare_chunk;
@@ -184,17 +185,17 @@ static void cb_done(void *arg) {   // completion thread
     for (int i = 0; i < r->nwritten; i++) vk_guest_written(r->written[i].addr, r->written[i].size);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
-        AcquireSRWLockExclusive(&spare_lock);
+        plat_mutex_lock(&spare_lock);
         int kept = nspare_pool < SPARE_POOLS;
         if (kept) spare_pool[nspare_pool++] = r->pools[i];
-        ReleaseSRWLockExclusive(&spare_lock);
+        plat_mutex_unlock(&spare_lock);
         if (!kept) vkDestroyDescriptorPool(c->device, r->pools[i], NULL);
     }
     for (int i = 0; i < r->nchunks; i++) {
-        AcquireSRWLockExclusive(&spare_lock);
+        plat_mutex_lock(&spare_lock);
         int kept = r->chunks[i].size == CHUNK_BYTES && nspare_chunk < SPARE_CHUNKS;
         if (kept) spare_chunk[nspare_chunk++] = r->chunks[i];
-        ReleaseSRWLockExclusive(&spare_lock);
+        plat_mutex_unlock(&spare_lock);
         if (!kept) vmaDestroyBuffer(c->vma, r->chunks[i].buf, r->chunks[i].alloc);
     }
     free(r->written), free(r->pools), free(r->chunks), free(r);
@@ -229,9 +230,9 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
         uint64_t n = size > CHUNK_BYTES ? size : CHUNK_BYTES;
         int reused = 0;
         if (n == CHUNK_BYTES) {
-            AcquireSRWLockExclusive(&spare_lock);
+            plat_mutex_lock(&spare_lock);
             if (nspare_chunk) *c = spare_chunk[--nspare_chunk], reused = 1;
-            ReleaseSRWLockExclusive(&spare_lock);
+            plat_mutex_unlock(&spare_lock);
         }
         if (reused) {
             c->used = 0;
@@ -485,8 +486,8 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     int ms = (rtype & 0x200) != 0;
     if ((img->samples > 1) != ms || (storage && ms)) return VK_NULL_HANDLE;
     if (storage && !(img->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 6)
+        static volatile int32_t said;
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 6)
             rt_log("vk_exec: storage binding of image %#llx (%ux%ux%u fmt %d) made without STORAGE usage: a dummy is bound",
                    (unsigned long long)img->addr, img->width, img->height, img->depth, (int)img->format);
         return VK_NULL_HANDLE;
@@ -718,8 +719,8 @@ static uint8_t type_of_handle(uint64_t h) {   // texture lock held
     }
     uint8_t cls = format_class(f);
     if (cls) {
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 5)
+        static volatile int32_t said;
+        if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 5)
             rt_log("vk_exec: texture slot %d (%ux%u vk format %d) answered as an integer texture (%s)", (int)(h & 0xfffff), img->width,
                    img->height, (int)f, cls == GFX_TEX_UINT ? "uint" : "sint");
     }
@@ -778,8 +779,8 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     answers_for(ex, st, ctl, slot_mask_of(serial, st), &a);
     for (int i = 0; i < 32; i++)
         if (a.tex_type[i] & (GFX_TEX_UINT | GFX_TEX_SINT)) {
-            static volatile LONG said;
-            if (InterlockedIncrement(&said) <= 5)
+            static volatile int32_t said;
+            if (__atomic_add_fetch(&said, 1, __ATOMIC_SEQ_CST) <= 5)
                 rt_log("vk_exec: stage %d slot %d answered type %#x (mask %#x) for program %llu", st, i, a.tex_type[i],
                        slot_mask_of(serial, st), (unsigned long long)serial);
             break;
@@ -1555,9 +1556,9 @@ static VkDescriptorSet alloc_set(VkExec *ex, VkDescriptorSetLayout layout) {
                                          .poolSizeCount = sizeof sizes / sizeof sizes[0], .pPoolSizes = sizes};
         if (r->npools == r->cpools) r->pools = grow(r->pools, &r->cpools, sizeof *r->pools);
         VkDescriptorPool pool = VK_NULL_HANDLE;
-        AcquireSRWLockExclusive(&spare_lock);
+        plat_mutex_lock(&spare_lock);
         if (nspare_pool) pool = spare_pool[--nspare_pool];
-        ReleaseSRWLockExclusive(&spare_lock);
+        plat_mutex_unlock(&spare_lock);
         if (!pool && vkCreateDescriptorPool(c->device, &pi, NULL, &pool) != VK_SUCCESS) rt_fatal("vk: descriptor pool failed");
         r->pools[r->npools++] = pool;
     }
@@ -2503,10 +2504,10 @@ typedef struct { uint8_t iid[8]; uint32_t groups[3]; uint64_t n; double ns; } Cs
 typedef struct { uint32_t pair; uint8_t iid[8]; uint32_t groups[3]; } CstRead;
 static VkQueryPool cst_pool;
 static uint32_t cst_next;
-static volatile LONG cst_busy[CST_PAIRS];
+static volatile int32_t cst_busy[CST_PAIRS];
 static CstShader cst_sh[CST_SHADERS];
 static int cst_nsh, cst_reads;
-static SRWLOCK cst_lock = SRWLOCK_INIT;
+static PlatMutex cst_lock = PLAT_MUTEX_INIT;
 
 static int cst_on(void) {
     static int on = -1;
@@ -2536,9 +2537,9 @@ static void cst_read(void *arg) {   // completion thread
     if (!period) vkGetPhysicalDeviceProperties(vk_ctx()->phys, &pr), period = pr.limits.timestampPeriod;
     int ok = vkGetQueryPoolResults(vk_ctx()->device, cst_pool, 2 * r->pair, 2, sizeof v, v, sizeof v[0],
                                    VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && v[1] >= v[0];
-    InterlockedExchange(&cst_busy[r->pair], 0);
+    __atomic_exchange_n(&cst_busy[r->pair], 0, __ATOMIC_SEQ_CST);
     if (!ok) { free(r); return; }
-    AcquireSRWLockExclusive(&cst_lock);
+    plat_mutex_lock(&cst_lock);
     int i = 0;
     while (i < cst_nsh && memcmp(cst_sh[i].iid, r->iid, 8)) i++;
     if (i == cst_nsh && cst_nsh < CST_SHADERS) memcpy(cst_sh[cst_nsh++].iid, r->iid, 8);
@@ -2560,7 +2561,7 @@ static void cst_read(void *arg) {   // completion thread
         memset(cst_sh, 0, sizeof cst_sh);
         cst_nsh = 0, cst_reads = 0;
     }
-    ReleaseSRWLockExclusive(&cst_lock);
+    plat_mutex_unlock(&cst_lock);
     free(r);
 }
 
@@ -2568,7 +2569,9 @@ static void cst_read(void *arg) {   // completion thread
 static int cst_begin(VkExec *ex) {
     if (!cst_on()) return -1;
     uint32_t p = cst_next++ % CST_PAIRS;
-    if (InterlockedCompareExchange(&cst_busy[p], 1, 0)) return -1;
+    int32_t was = 0;
+    __atomic_compare_exchange_n(&cst_busy[p], &was, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    if (was) return -1;
     vkCmdResetQueryPool(ex->cb, cst_pool, 2 * p, 2);
     vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, cst_pool, 2 * p);
     return (int)p;
@@ -2661,8 +2664,8 @@ static uint32_t *ind_map, ind_next;
 typedef struct { uint32_t slot; char hex[17]; } IndRead;
 static void ind_read(void *arg) {
     IndRead *r = arg;
-    static volatile LONG n;
-    if (InterlockedIncrement(&n) <= 200) {
+    static int n;
+    if (__atomic_add_fetch(&n, 1, __ATOMIC_SEQ_CST) <= 200) {
         const uint32_t *v = ind_map + 4 * r->slot;
         const uint32_t *lim = vk_ctx()->props.limits.maxComputeWorkGroupCount;
         rt_log("vk_exec: OOT_IND_LOG: indirect dispatch of %s: %u x %u x %u groups%s", r->hex, v[0], v[1], v[2],
@@ -2799,7 +2802,7 @@ static void bind_handles(const VkExec *ex, uint64_t *dst, int cap, const p_bind_
 // recording made before may still name it (they are small and few).
 #define COMBO_N 1024
 static struct Combo { const prog_t *src[6]; uint64_t src_serial[6]; prog_t *prog; } combos[COMBO_N];
-static SRWLOCK combo_lock = SRWLOCK_INIT;
+static PlatMutex combo_lock = PLAT_MUTEX_INIT;
 
 // The shader data entry of p for NVN stage st, from its control block's stage word (find_stage_scan).
 static const NVNshaderData *stage_entry(const prog_t *p, int st) {
@@ -2823,7 +2826,7 @@ static const prog_t *combined_program(const prog_t *const sp[6]) {
     uint64_t h = 0;
     for (int st = 0; st < 6; st++) h = (h ^ (uintptr_t)sp[st] ^ (sp[st] ? sp[st]->serial << 1 : 0)) * 0x9E3779B97F4A7C15ull;
     struct Combo *e = &combos[h >> 54];
-    AcquireSRWLockExclusive(&combo_lock);
+    plat_mutex_lock(&combo_lock);
     int hit = e->prog != NULL;
     for (int st = 0; hit && st < 6; st++)
         hit = e->src[st] == sp[st] && e->src_serial[st] == (sp[st] ? sp[st]->serial : 0);
@@ -2840,7 +2843,7 @@ static const prog_t *combined_program(const prog_t *const sp[6]) {
         for (int st = 0; st < 6; st++) e->src[st] = sp[st], e->src_serial[st] = sp[st] ? sp[st]->serial : 0;
     }
     const prog_t *r = e->prog;
-    ReleaseSRWLockExclusive(&combo_lock);
+    plat_mutex_unlock(&combo_lock);
     return r;
 }
 

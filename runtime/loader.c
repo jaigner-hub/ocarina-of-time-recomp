@@ -9,13 +9,13 @@
 //
 // The lifted C was generated from the unrelocated words of .text and .rodata and embeds absolute guest addresses, so
 // each module must sit at its layout base and relocations may only write the data segment.
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "host.h"
 #include "layout.h"
+#include "platform/platform.h"
 
 // hostfn.c, for the loader only.
 uint64_t hostfn_register_observer(const char *name, GuestFn fn, uint64_t original);
@@ -58,7 +58,7 @@ static Mod mods[MOD_COUNT];
 static int nmods;
 static uint64_t identity_refs, stubs;
 static int *ovr_used, *obs_used;   // per linked table entry, plus probe overrides counted separately
-static SRWLOCK plt_lock = SRWLOCK_INIT;
+static PlatMutex plt_lock = PLAT_MUTEX_INIT;
 
 int ldr_count(void) { return nmods; }
 const RtLoaded *ldr_module(int i) { return i >= 0 && i < nmods ? &mods[i].pub : NULL; }
@@ -67,21 +67,9 @@ static uint32_t rd32(uint64_t a) { return LD32(a); }
 
 // ---- files
 static uint8_t *read_file(const char *path, size_t *len) {
-    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
-    LARGE_INTEGER size;
-    uint8_t *p = NULL;
-    if (GetFileSizeEx(h, &size) && size.QuadPart < (1ll << 31)) {
-        p = malloc(size.QuadPart ? (size_t)size.QuadPart : 1);
-        DWORD got = 0;
-        if (p && ReadFile(h, p, (DWORD)size.QuadPart, &got, NULL) && got == (DWORD)size.QuadPart) {
-            *len = (size_t)size.QuadPart;
-        } else {
-            free(p);
-            p = NULL;
-        }
-    }
-    CloseHandle(h);
+    uint64_t n = 0;
+    uint8_t *p = plat_file_read(path, &n);
+    if (p) *len = (size_t)n;
     return p;
 }
 
@@ -299,9 +287,9 @@ static void load_module(Mod *m, const char *dir, const RtLayoutEntry *lay) {
     if (size != lay->size)
         rt_fatal("loader: %s image is %#llx bytes, layout.h says %#llx: generated C and game files differ", lay->name,
                  (unsigned long long)size, (unsigned long long)lay->size);
-    if (!VirtualAlloc((void *)(uintptr_t)lay->base, size, MEM_COMMIT, PAGE_READWRITE))
+    if (!plat_mem_commit(lay->base, size))
         rt_fatal("loader: cannot commit %s at %#llx (error %lu)", lay->name, (unsigned long long)lay->base,
-                 GetLastError());
+                 (unsigned long)plat_last_error());
     for (int i = 0; i < 3; i++) {
         if ((uint64_t)seg[i].mem_off + seg[i].size > size) rt_fatal("loader: %s segment %d exceeds the image", lay->name, i);
         nso_segment(raw, &seg[i], (uint8_t *)(uintptr_t)(lay->base + seg[i].mem_off), lay->name, i);
@@ -456,9 +444,8 @@ static void verify_identity(void) {
 
 // .text and .rodata read-only: guest code never executes from guest memory, and nothing may write them.
 static void seal(Mod *m) {
-    DWORD old;
-    if (!VirtualProtect((void *)(uintptr_t)m->pub.base, m->pub.data_off, PAGE_READONLY, &old))
-        rt_fatal("loader: cannot seal %s (error %lu)", m->pub.name, GetLastError());
+    if (!plat_mem_protect(m->pub.base, m->pub.data_off, PLAT_PROT_READ))
+        rt_fatal("loader: cannot seal %s (error %lu)", m->pub.name, (unsigned long)plat_last_error());
 }
 
 void ldr_load(const char *exefs_dir) {
@@ -553,9 +540,9 @@ uint64_t ldr_plt_stub(const char *module, const char *name) {
     for (int i = 0; i < nmods; i++)
         if (!strcmp(mods[i].pub.name, module)) m = &mods[i];
     if (!m) return 0;
-    AcquireSRWLockExclusive(&plt_lock);
+    plat_mutex_lock(&plt_lock);
     if (!m->plt_slot) find_plt(m);
-    ReleaseSRWLockExclusive(&plt_lock);
+    plat_mutex_unlock(&plt_lock);
     for (uint64_t j = 0; j < m->njmprel; j++) {
         uint32_t si = (uint32_t)(m->jmprel[j].info >> 32);
         if ((uint32_t)m->jmprel[j].info != R_JUMP_SLOT || strcmp(sym_name(m, si), name)) continue;
@@ -593,7 +580,7 @@ static int failures;
 static volatile long probe_hits;
 
 static void probe_override(Cpu *c) {
-    InterlockedIncrement(&probe_hits);
+    __atomic_add_fetch(&probe_hits, 1, __ATOMIC_SEQ_CST);
     c->x[0] = PROBE_MAGIC;
 }
 
@@ -614,9 +601,9 @@ static void check_segments(const char *dir) {
             free(buf);
         }
         free(raw);
-        MEMORY_BASIC_INFORMATION mbi;
-        int ro = VirtualQuery((void *)(uintptr_t)m->pub.base, &mbi, sizeof mbi) && mbi.Protect == PAGE_READONLY &&
-                 mbi.RegionSize >= m->pub.data_off;
+        uint64_t run_end = 0;
+        int ro = plat_mem_state(m->pub.base, m->pub.base + m->pub.data_off, &run_end) == PLAT_PROT_READ &&
+                 run_end == m->pub.base + m->pub.data_off;
         printf("  %-8s text %#x+%#x rodata %#x+%#x: bytes %s the NSO, %s\n", m->pub.name, seg[0].mem_off, seg[0].size,
                seg[1].mem_off, seg[1].size, same ? "equal" : "DIFFER FROM", ro ? "read-only" : "NOT READ-ONLY");
         CHECK(same, "%s .text/.rodata changed after relocation", m->pub.name);
@@ -650,7 +637,8 @@ static void check_got(void) {
     CHECK(stub, "no PLT stub in main for %s", PROBE_SYMBOL);
 
     hostfn_seal();
-    Cpu *c = _aligned_malloc(sizeof(Cpu), 64);
+    static Cpu probe_cpu __attribute__((aligned(64)));   // static: the probe runs once per process
+    Cpu *c = &probe_cpu;
     memset(c, 0, sizeof *c);
     uint8_t *stack = mem_kernel_alloc(0x10000, 16);
     c->sp = (uint64_t)(uintptr_t)stack + 0x10000;
@@ -666,7 +654,6 @@ static void check_got(void) {
     CHECK(r2 == PROBE_MAGIC && h2 == 2, "the lifted PLT stub did not reach the host function");
     CHECK(c->x[30] == 0 && c->pc == 0 && c->x[19] == 0x1919, "rt_call did not restore x30/pc or lost x19");
     mem_kernel_free(stack, 0x10000);
-    _aligned_free(c);
 }
 
 int probe_loader(void) {

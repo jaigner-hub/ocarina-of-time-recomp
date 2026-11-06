@@ -8,7 +8,7 @@
 // 2026-11-05), so this file starts empty, as MP4's did against FE3H's.
 //
 // Each entry names the call that needs it and the game version it was seen in.
-#include <windows.h>
+#include "platform/platform.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,8 +125,8 @@ static void ov_socket_errno(Cpu *c) { ret_x(c, SOCKET_ENETDOWN); }         // in
 // engines can make a wakeup descriptor ("No event engine could be initialized", main+0x21f0c7c). EventFd hands out
 // fake descriptors from 0x1000; reads on them report one event, writes, fcntl, close and socket options succeed; Poll
 // and Select sleep for the timeout (100 ms at most) and report nothing ready. Real sockets (Socket, Connect) stay down.
-static volatile LONG fake_fd_next = 0x1000;
-static void ov_eventfd_new(Cpu *c) { ret_x(c, (uint32_t)InterlockedIncrement(&fake_fd_next)); }
+static volatile int32_t fake_fd_next = 0x1000;
+static void ov_eventfd_new(Cpu *c) { ret_x(c, (uint32_t)__atomic_add_fetch(&fake_fd_next, 1, __ATOMIC_SEQ_CST)); }
 static void ov_eventfd_read(Cpu *c) {   // int EventFdRead(int fd, uint64_t *value)
     uint64_t *v = arg_p(c, 1);
     if (v) *v = 1;
@@ -139,7 +139,7 @@ static void ov_poll_sleep(Cpu *c, int ms) {
     if (ms < 0 || ms > 100) ms = 100;
     if (ms) {
         int away = kern_core_away();
-        Sleep((DWORD)ms);
+        plat_sleep_ns((uint64_t)ms * 1000000u);
         kern_core_back(&away);
     }
     ret_x(c, 0);

@@ -9,9 +9,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #include "gfx.h"
+#include "platform/platform.h"
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+#define MAX_PATH 260   // the buffers keep the Windows sizes (MAX_PATH * 2) on both systems
+
+// The last path separator of s, either kind (Windows executables have backslashes): NULL when there is none.
+static char *path_sep(const char *s) {
+    char *a = strrchr(s, '/'), *b = strrchr(s, '\\');
+    return !a ? b : !b ? a : a > b ? a : b;
+}
 
 int gfx_shader_raw_request(const char *line, char *reply, size_t reply_size);
 uint64_t gfx_shader_requests(void);
@@ -53,13 +66,12 @@ static const char *str_field(const char *from, const char *to, const char *name,
 // The repository root: the nearest parent of oot.exe holding build/v131072/shaders/programs.json.
 static int find_root(char *root, size_t n) {
     char exe[MAX_PATH * 2];
-    DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
-    if (!len || len >= sizeof exe) return 0;
-    for (char *cut = strrchr(exe, '\\'); cut; cut = strrchr(exe, '\\')) {
+    if (!plat_exe_path(exe, sizeof exe)) return 0;
+    for (char *cut = path_sep(exe); cut; cut = path_sep(exe)) {
         *cut = 0;
         char p[MAX_PATH * 2 + 40];
-        snprintf(p, sizeof p, "%s\\build\\v131072\\shaders\\programs.json", exe);
-        if (GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES) return snprintf(root, n, "%s", exe) < (int)n;
+        snprintf(p, sizeof p, "%s/build/v131072/shaders/programs.json", exe);
+        if (plat_file_exists(p)) return snprintf(root, n, "%s", exe) < (int)n;
     }
     return 0;
 }
@@ -113,13 +125,13 @@ static char root[MAX_PATH * 2];
 static const GfxShader *translate(const Entry *e, int *err) {
     char path[MAX_PATH * 2 + 64];
     uint8_t control[0x400] = {0};
-    snprintf(path, sizeof path, "%s\\build\\v131072\\shaders\\ctl\\%s.ctl", root, e->key);
+    snprintf(path, sizeof path, "%s/build/v131072/shaders/ctl/%s.ctl", root, e->key);
     size_t ctl_size, code_size;
     char *ctl = slurp(path, &ctl_size);
     if (!ctl || ctl_size > sizeof control) return free(ctl), *err = 1, NULL;
     memcpy(control, ctl, ctl_size);
     free(ctl);
-    snprintf(path, sizeof path, "%s\\build\\v131072\\shaders\\code\\%s.code", root, e->key);
+    snprintf(path, sizeof path, "%s/build/v131072/shaders/code/%s.code", root, e->key);
     char *code = slurp(path, &code_size);
     if (!code) return *err = 1, NULL;
     GfxShaderAnswers a = {0};
@@ -129,20 +141,20 @@ static const GfxShader *translate(const Entry *e, int *err) {
     return s;
 }
 
+static int remove_one(const char *name, void *ctx) {
+    char f[MAX_PATH * 2];
+    snprintf(f, sizeof f, "%s/%s", (const char *)ctx, name);
+    plat_file_delete(f);   // files only: the probe's folder has no subfolders
+    return 1;
+}
+
 static void remove_dir(const char *dir) {
-    char pat[MAX_PATH * 2];
-    snprintf(pat, sizeof pat, "%s\\*", dir);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            char f[MAX_PATH * 2];
-            snprintf(f, sizeof f, "%s\\%s", dir, fd.cFileName);
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) DeleteFileA(f);
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }
+    plat_file_list(dir, "", remove_one, (void *)dir);
+#ifdef _WIN32
     RemoveDirectoryA(dir);
+#else
+    rmdir(dir);
+#endif
 }
 
 #define FAIL_IF(cond, ...) do { if (cond) { printf("probe-shader: FAILED: " __VA_ARGS__); printf("\n"); remove_dir(dir); return 1; } } while (0)
@@ -153,7 +165,7 @@ int probe_shader(void) {
         printf("probe-shader: skipped: build/v131072/shaders/programs.json (the shader census) is not present\n");
         return 0;
     }
-    snprintf(path, sizeof path, "%s\\build\\v131072\\shaders\\programs.json", root);
+    snprintf(path, sizeof path, "%s/build/v131072/shaders/programs.json", root);
     size_t jobs_size;
     char *jobs = slurp(path, &jobs_size);
     CHECK(jobs, "cannot read %s", path);
@@ -162,8 +174,12 @@ int probe_shader(void) {
     CHECK(count >= WANT, "only %d census shaders usable", count);
 
     char dir[MAX_PATH];
-    snprintf(dir, sizeof dir, "%s\\oot-shader-probe-%lu", getenv("TEMP") ? getenv("TEMP") : ".", GetCurrentProcessId());
-    CHECK(_putenv_s("OOT_SHADER_CACHE", dir) == 0, "cannot set OOT_SHADER_CACHE");
+#ifdef _WIN32
+    snprintf(dir, sizeof dir, "%s/oot-shader-probe-%lu", getenv("TEMP") ? getenv("TEMP") : ".", GetCurrentProcessId());
+#else
+    snprintf(dir, sizeof dir, "%s/oot-shader-probe-%lu", getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", (unsigned long)getpid());
+#endif
+    CHECK(plat_setenv("OOT_SHADER_CACHE", dir), "cannot set OOT_SHADER_CACHE");
 
     // pass 1: translate through the service; a candidate the lowering cannot take yet (docs/phase3.md) is skipped
     const GfxShader *first[WANT];
@@ -225,7 +241,7 @@ int probe_shader(void) {
     // and .c1), the translator's input form.
     const Entry *e = &entries[0];
     char c1_path[MAX_PATH * 2 + 128], c1_hex[16384] = "";
-    snprintf(c1_path, sizeof c1_path, "%s\\build\\v131072\\shaders\\lowered\\%.64s.c1", root, e->key);
+    snprintf(c1_path, sizeof c1_path, "%s/build/v131072/shaders/lowered/%.64s.c1", root, e->key);
     size_t c1_size = 0;
     char *c1 = slurp(c1_path, &c1_size);
     FAIL_IF(!c1 || c1_size * 2 >= sizeof c1_hex, "%s is missing (tools/shader_census.py --lower writes it)", c1_path);

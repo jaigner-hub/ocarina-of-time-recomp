@@ -5,9 +5,11 @@
 // A DPI-unaware process gets every window and monitor size scaled down by the display scale and its output stretched
 // back up by Windows; the probe fails unless the process is per-monitor aware (v2). Needs no game files and no GPU.
 #include <stdio.h>
-#include <windows.h>
 
 #include "host.h"
+
+#if defined(_WIN32)
+#include <windows.h>
 
 static const char *awareness_name(DPI_AWARENESS_CONTEXT ctx) {
     if (AreDpiAwarenessContextsEqual(ctx, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) return "per-monitor aware v2";
@@ -34,3 +36,11 @@ int probe_dpi(void) {
     printf("probe-dpi: %s\n", ok ? "PASS" : "FAIL (the process is not per-monitor aware v2)");
     return ok ? 0 : 1;
 }
+
+#else
+// The DPI awareness of a window is a Windows setting: elsewhere the probe has nothing to check and fails.
+int probe_dpi(void) {
+    printf("probe-dpi: Windows only\n");
+    return 1;
+}
+#endif

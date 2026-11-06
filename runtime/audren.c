@@ -8,7 +8,11 @@
 // service validates every section against the header, keeps server-side voice state, advances it in real time (one
 // frame of sample_count / sample_rate seconds per render tick, signalling the renderer's event) and writes the output
 // status the client expects. The mixer behind it is audio_mixer.c.
-#include <windows.h>
+#include <stdatomic.h>
+#include "platform/platform.h"
+#ifdef _WIN32
+#include <windows.h>   // the thread priority below
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,9 +22,9 @@
 #include "host.h"
 #include "ipc.h"
 
-static volatile long g_live;
+static atomic_long g_live;
 
-long audren_renderers_live(void) { return InterlockedCompareExchange(&g_live, 0, 0); }
+long audren_renderers_live(void) { return atomic_load(&g_live); }
 
 static int revision_number(uint32_t rev) { return (int)(rev >> 24) - '0'; }
 
@@ -47,7 +51,7 @@ static AudioRenderer *renderer_new(const AudrenParameter *p) {
     r->effects = calloc((size_t)(p->effect_count ? p->effect_count : 1), sizeof *r->effects);
     r->channels = calloc((size_t)p->voice_count * 6, sizeof *r->channels);
     need(r->voices && r->pools && r->mixes && r->sinks && r->effects && r->channels, "renderer tables");
-    InitializeSRWLock(&r->lock);
+    plat_mutex_init(&r->lock);
     r->event = kern_event_new();
     r->state = 1;   // stopped
     return r;
@@ -116,8 +120,8 @@ static void update_voice(AudioRenderer *r, int i, const AudrenVoiceIn *in) {
     const int traced = (rt_trace & RT_TRACE_AUDIO) != 0;
     if (traced && was != v->state) {
         static const char *const states[] = {"stopped", "started", "paused", "stopping"};
-        rt_log("audren: voice %u %s -> %s (new %u, play state %u): fmt %u ch %u rate %u pitch %.2f vol %.2f mix %d splitter %u buffer index %u",
-               in->id, states[was & 3], states[v->state & 3], in->is_new, in->play_state, in->sample_format, in->channel_count,
+        rt_log("audren: %.3f voice %u %s -> %s (new %u, play state %u): fmt %u ch %u rate %u pitch %.2f vol %.2f mix %d splitter %u buffer index %u",
+               rt_uptime_s(), in->id, states[was & 3], states[v->state & 3], in->is_new, in->play_state, in->sample_format, in->channel_count,
                in->sample_rate, in->pitch, in->volume, in->mix_id, in->splitter_id, in->wave_buffer_index);
     }
     for (unsigned i = 0; i < 4; i++) {   // a new buffer waits until a render frame finds the voice playing
@@ -125,9 +129,16 @@ static void update_voice(AudioRenderer *r, int i, const AudrenVoiceIn *in) {
         if (!w->sent) {
             v->buffers[i] = *w;
             v->pending[i] = 1;
-            if (traced && in->sample_format != FMT_ADPCM)
-                rt_log("audren: voice %u buffer %u: %#llx+%llu samples %u..%u loop %u eos %u", in->id, i,
-                       (unsigned long long)w->address, (unsigned long long)w->size, w->start, w->end, w->loop, w->end_of_stream);
+            if (traced && in->sample_format != FMT_ADPCM) {
+                int peak = -1;   // loudest 16-bit sample of the buffer; -1 when it is not 16-bit PCM
+                if (in->sample_format == FMT_PCM16 && w->address && w->size >= 2) {
+                    const int16_t *pcm = (const int16_t *)(uintptr_t)w->address;
+                    peak = 0;
+                    for (uint64_t k = 0; k < w->size / 2; k++) { int a = pcm[k] < 0 ? -pcm[k] : pcm[k]; if (a > peak) peak = a; }
+                }
+                rt_log("audren: voice %u buffer %u: %#llx+%llu samples %u..%u loop %u eos %u peak %d", in->id, i,
+                       (unsigned long long)w->address, (unsigned long long)w->size, w->start, w->end, w->loop, w->end_of_stream, peak);
+            }
         }
     }
     v->flush += in->flush_wave_buffer_count;
@@ -217,7 +228,7 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     memcpy(&h, input, sizeof h);
     need(h.total <= in_size, "update total size");
     Reader in = {input + sizeof h, input + h.total};
-    AcquireSRWLockExclusive(&r->lock);
+    plat_mutex_lock(&r->lock);
     r->revision = h.revision;
     const int vc = r->param.voice_count, ec = r->param.effect_count, sc = r->param.sink_count,
               mc = r->param.submix_count + 1;
@@ -342,7 +353,7 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     w += 0x10;                    // performance: nothing written
     w += AUDREN_BEHAVIOR_OUT;     // behavior: no errors
     memcpy(w, &r->elapsed_frames, 8);
-    ReleaseSRWLockExclusive(&r->lock);
+    plat_mutex_unlock(&r->lock);
 }
 
 // ---- render tick: one frame every sample_count / sample_rate seconds of the host clock, that period stretched or
@@ -379,22 +390,16 @@ static void advance_voice(AudioRenderer *r, ServerVoice *v, double out_seconds) 
     }
 }
 
-static void wait_ns(HANDLE timer, uint64_t ns) {
-    LARGE_INTEGER due = {.QuadPart = -(LONGLONG)((ns + 99) / 100)};   // relative, 100 ns units
-    if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) rt_fatal("audren: SetWaitableTimer failed (error %lu)", GetLastError());
-    WaitForSingleObject(timer, INFINITE);
-}
-
-static DWORD WINAPI render_thread(void *p) {
+// The render thread's pacing is plat_sleep_ns (a high-resolution timer on each OS).
+static void render_thread(void *p) {
     AudioRenderer *r = p;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
-    if (!timer) rt_fatal("audren: CreateWaitableTimerExW failed (error %lu)", GetLastError());
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // no platform.h call for this; Linux keeps the default
+#endif
     const uint64_t frame_ns = (uint64_t)r->param.sample_count * 1000000000ull / (uint64_t)r->param.sample_rate;
     const double frame = (double)r->param.sample_count / r->param.sample_rate;
     uint64_t next = kern_now_ns();
-    while (InterlockedCompareExchange(&r->running, 0, 0)) {
+    while (atomic_load(&r->running)) {
         // One frame per period, never two in a row on purpose: the DSP renders at a fixed cadence and this game's
         // auxiliary effect ring holds two frames, which its DSP code processes between consecutive renders. Pacing by
         // the queue alone (render whenever the device took it below the target) followed the device's pulls of a
@@ -405,10 +410,10 @@ static DWORD WINAPI render_thread(void *p) {
         int paced;
         double err = audio_mixer_queue_error(r, now, &paced);
         uint64_t step = paced ? (uint64_t)(frame_ns * (1.0 + 0.02 * err) + 0.5) : frame_ns;
-        if (next > now) wait_ns(timer, next - now);
+        if (next > now) plat_sleep_ns(next - now);
         else if (now - next > 100000000ull) next = now;   // fell far behind (debugger, sleep): resynchronise
         next += step;
-        AcquireSRWLockExclusive(&r->lock);
+        plat_mutex_lock(&r->lock);
         if (r->state == 0) {
             voices_prepare(r);
             audio_mixer_render(r, frame);
@@ -422,11 +427,9 @@ static DWORD WINAPI render_thread(void *p) {
                        (unsigned long long)r->flushed);
             }
         }
-        ReleaseSRWLockExclusive(&r->lock);
+        plat_mutex_unlock(&r->lock);
         kern_event_signal(r->event);
     }
-    CloseHandle(timer);
-    return 0;
 }
 
 // ---- IAudioRenderer
@@ -458,16 +461,16 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
         return;
     }
     case 5:   // Start
-        AcquireSRWLockExclusive(&r->lock);
+        plat_mutex_lock(&r->lock);
         r->state = 0;
         audio_mixer_set_running(r, 1);
-        ReleaseSRWLockExclusive(&r->lock);
+        plat_mutex_unlock(&r->lock);
         return;
     case 6:   // Stop
-        AcquireSRWLockExclusive(&r->lock);
+        plat_mutex_lock(&r->lock);
         r->state = 1;
         audio_mixer_set_running(r, 0);
-        ReleaseSRWLockExclusive(&r->lock);
+        plat_mutex_unlock(&r->lock);
         return;
     case 7: rs->copy[rs->ncopy++] = kern_event_readable(r->event); return;   // QuerySystemEvent
     case 8: r->time_limit = IPC_ARG(rq, uint32_t, 0); return;                // SetRenderingTimeLimit
@@ -482,12 +485,11 @@ static void renderer_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *r
 
 static void renderer_close(void *p) {
     AudioRenderer *r = p;
-    InterlockedExchange(&r->running, 0);
+    atomic_store(&r->running, 0);
     int away = kern_core_away();
-    WaitForSingleObject(r->thread, INFINITE);
+    plat_thread_join(r->thread);
     kern_core_back(&away);
-    CloseHandle(r->thread);
-    InterlockedDecrement(&g_live);
+    atomic_fetch_sub(&g_live, 1);
     audio_mixer_close(r);
     kern_handle_close(r->event);
     rt_log("audren: renderer closed after %llu frames", (unsigned long long)r->elapsed_frames);
@@ -504,11 +506,11 @@ void audren_manager_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
         IpcTransferMemory *tm = kern_handle_get(rq->copy[0], KERN_TMEM);
         need(tm && tm->size >= work, "OpenAudioRenderer work buffer is not a transfer memory of the stated size");
         AudioRenderer *r = renderer_new(&p);
-        r->running = 1;
+        atomic_store(&r->running, 1);
         audio_mixer_open(r);
-        r->thread = CreateThread(NULL, 0, render_thread, r, 0, NULL);
-        if (!r->thread) rt_fatal("audren: render thread CreateThread failed (error %lu)", GetLastError());
-        InterlockedIncrement(&g_live);
+        r->thread = plat_thread_new(render_thread, r, "audren");
+        if (!r->thread) rt_fatal("audren: render thread start failed (error %u)", plat_last_error());
+        atomic_fetch_add(&g_live, 1);
         rt_log("audren: renderer open %d Hz x%d, mix buffers %d, voices %d, effects %d, submixes %d, sinks %d, "
                "splitters %d/%d, REV%d, work buffer %#llx+%#llx",
                p.sample_rate, p.sample_count, p.mix_buffer_count, p.voice_count, p.effect_count, p.submix_count,

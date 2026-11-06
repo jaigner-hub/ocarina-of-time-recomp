@@ -9,9 +9,8 @@
 //
 // Every region is a plain reservation; pages are committed and decommitted at 4 KiB granularity. Decommitted pages
 // come back zeroed, so no stale-page bookkeeping is needed. The stack and heap block and the alias region are
-// reserved with MEM_WRITE_WATCH: mem_written_pages reports the pages the CPU wrote, which
+// reserved with write watch: mem_written_pages reports the pages the CPU wrote, which
 // the Vulkan back end uploads again.
-#include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +18,7 @@
 #include "cfg.h"
 #include "host.h"
 #include "layout.h"
+#include "platform/platform.h"
 
 #define PAGE 0x1000ull
 #define GiB (1ull << 30)
@@ -60,7 +60,7 @@ static uint64_t mods_lo, mods_hi;   // fixed module window
 static uint64_t shadow_next, shadow_end;   // virtual pool shadow reservations (mem_shadow_reserve): next candidate, limit
 static uint64_t shadow_lo[64], shadow_hi[64];   // the reservations made, for watched()
 static int nshadow;
-static SRWLOCK lock = SRWLOCK_INIT;
+static PlatMutex lock = PLAT_MUTEX_INIT;
 static uint64_t heap_size, alias_bytes;
 static uint8_t *alias_pages;        // 1 per mapped 4 KiB page of the alias region
 typedef struct { uint64_t dst, src, size; } StackMap;
@@ -69,15 +69,6 @@ static unsigned nstack_maps;
 static uint8_t *module_perm[MOD_COUNT];   // per data page of each module: perm | ATTR_PERMISSION_LOCKED
 
 static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
-
-static void *reserve_at(uint64_t at, uint64_t size, DWORD extra) {
-    void *p = VirtualAlloc((void *)(uintptr_t)at, size, MEM_RESERVE | extra, PAGE_NOACCESS);
-    if (p && p != (void *)(uintptr_t)at) {
-        VirtualFree(p, 0, MEM_RELEASE);
-        p = NULL;
-    }
-    return p;
-}
 
 // ---- frozen regions
 // A 2 MiB region of the watched reservations that nothing wrote for a while can be made read-only (mem_freeze), so the
@@ -90,10 +81,10 @@ static void *reserve_at(uint64_t at, uint64_t size, DWORD extra) {
 #define FRZ_SIZE (1ull << FRZ_SHIFT)
 #define FRZ_HOLD_MS 5000u
 static volatile uint8_t frz[RT_ADDRESS_LIMIT >> FRZ_SHIFT];
-static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: GetTickCount of the last thaw request, 0 never
-static volatile LONG nfrz;
-static SRWLOCK frz_lock = SRWLOCK_INIT;
-static volatile LONG64 frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
+static uint32_t thaw_ms[RT_ADDRESS_LIMIT >> FRZ_SHIFT];   // frz_lock: plat_tick_ms of the last thaw request, 0 never
+static volatile int32_t nfrz;
+static PlatMutex frz_lock = PLAT_MUTEX_INIT;
+static volatile int64_t frz_count[4];   // freezes; thaws by a write fault, by mem_thaw, by a mapping change
 
 static int watched(uint64_t addr, uint64_t size) {
     const RtGuestLayout *g = &L;
@@ -107,27 +98,24 @@ static int watched(uint64_t addr, uint64_t size) {
 
 // frz_lock held exclusively. why: 1 a write fault, 2 mem_thaw (holds the region thawed), 3 a mapping change here.
 static void thaw_locked(uint64_t r, int why) {
-    if (why == 2) thaw_ms[r] = (uint32_t)GetTickCount64() | 1;
+    if (why == 2) thaw_ms[r] = (uint32_t)plat_tick_ms() | 1;
     if (!frz[r]) return;
-    DWORD old;
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE;
-    if (!VirtualProtect((void *)(uintptr_t)a, FRZ_SIZE, PAGE_READWRITE, &old)) {
+    if (!plat_mem_protect(a, FRZ_SIZE, PLAT_PROT_RW)) {
         // Not all committed (freeze_locked left reserved holes): the read-only runs only. Every committed page of a
         // frozen region was read-write at the freeze, and mapping changes thaw before they run, so these are all ours.
-        MEMORY_BASIC_INFORMATION mbi;
-        while (a < end && VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi)) {
-            uint64_t b = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-            if (b > end) b = end;
-            if (mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READONLY &&
-                !VirtualProtect((void *)(uintptr_t)a, b - a, PAGE_READWRITE, &old))
+        uint64_t b;
+        while (a < end) {
+            int st = plat_mem_state(a, end, &b);
+            if (st == PLAT_PROT_READ && !plat_mem_protect(a, b - a, PLAT_PROT_RW))
                 rt_fatal("memory: thawing %#llx+%#llx failed (error %lu)", (unsigned long long)a,
-                         (unsigned long long)(b - a), GetLastError());
+                         (unsigned long long)(b - a), (unsigned long)plat_last_error());
             a = b;
         }
     }
     __atomic_store_n(&frz[r], 0, __ATOMIC_RELEASE);
-    InterlockedDecrement(&nfrz);
-    InterlockedIncrement64(&frz_count[why]);
+    __atomic_sub_fetch(&nfrz, 1, __ATOMIC_SEQ_CST);
+    __atomic_add_fetch(&frz_count[why], 1, __ATOMIC_SEQ_CST);
 }
 
 // frz_lock held exclusively.
@@ -138,9 +126,9 @@ static void thaw_range_locked(uint64_t a, uint64_t n, int why) {
 }
 
 void mem_thaw(uint64_t a, uint64_t n) {
-    AcquireSRWLockExclusive(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
+    plat_mutex_lock(&frz_lock);   // also when nothing is frozen: the hold keeps a read's buffer writable
     thaw_range_locked(a, n, 2);
-    ReleaseSRWLockExclusive(&frz_lock);
+    plat_mutex_unlock(&frz_lock);
 }
 
 // frz_lock held exclusively. Makes the committed pages of region r read-only when every one of them is read-write;
@@ -148,21 +136,19 @@ void mem_thaw(uint64_t a, uint64_t n) {
 static int freeze_locked(uint64_t r) {
     uint64_t a = r << FRZ_SHIFT, end = a + FRZ_SIZE, run[16][2];
     int n = 0;
-    MEMORY_BASIC_INFORMATION mbi;
     for (uint64_t x = a; x < end; ) {
-        if (!VirtualQuery((void *)(uintptr_t)x, &mbi, sizeof mbi)) return 0;
-        uint64_t y = (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-        if (y > end) y = end;
-        if (mbi.State == MEM_COMMIT) {
-            if (mbi.Protect != PAGE_READWRITE || n == 16) return 0;
+        uint64_t y;
+        int st = plat_mem_state(x, end, &y);
+        if (st == PLAT_MEM_RESERVED) {
+        } else if (st == PLAT_PROT_RW) {
+            if (n == 16) return 0;
             run[n][0] = x, run[n][1] = y, n++;
-        } else if (mbi.State != MEM_RESERVE) return 0;
+        } else return 0;
         x = y;
     }
-    DWORD old;
     for (int i = 0; i < n; i++)
-        if (!VirtualProtect((void *)(uintptr_t)run[i][0], run[i][1] - run[i][0], PAGE_READONLY, &old)) {
-            while (i--) VirtualProtect((void *)(uintptr_t)run[i][0], run[i][1] - run[i][0], PAGE_READWRITE, &old);
+        if (!plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_READ)) {
+            while (i--) plat_mem_protect(run[i][0], run[i][1] - run[i][0], PLAT_PROT_RW);
             return 0;
         }
     return n > 0;
@@ -172,16 +158,16 @@ int mem_freeze(uint64_t a) {
     if ((a & (FRZ_SIZE - 1)) || !watched(a, FRZ_SIZE)) return 0;
     uint64_t r = a >> FRZ_SHIFT;
     int ok = 0;
-    AcquireSRWLockExclusive(&frz_lock);
+    plat_mutex_lock(&frz_lock);
     if (frz[r]) ok = 1;
-    else if (thaw_ms[r] && (int32_t)((uint32_t)GetTickCount64() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
+    else if (thaw_ms[r] && (int32_t)((uint32_t)plat_tick_ms() - thaw_ms[r]) < (int32_t)FRZ_HOLD_MS) ok = 0;   // |1 may be ahead
     else if (freeze_locked(r)) {
         __atomic_store_n(&frz[r], 1, __ATOMIC_RELEASE);
-        InterlockedIncrement(&nfrz);
-        InterlockedIncrement64(&frz_count[0]);
+        __atomic_add_fetch(&nfrz, 1, __ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&frz_count[0], 1, __ATOMIC_SEQ_CST);
         ok = 1;
     }
-    ReleaseSRWLockExclusive(&frz_lock);
+    plat_mutex_unlock(&frz_lock);
     return ok;
 }
 
@@ -189,60 +175,53 @@ int mem_frozen(uint64_t a) { return a < RT_ADDRESS_LIMIT && __atomic_load_n(&frz
 
 void mem_freeze_stats(uint64_t *frozen, uint64_t *freezes, uint64_t *fault_thaws, uint64_t *other_thaws) {
     *frozen = (uint64_t)__atomic_load_n(&nfrz, __ATOMIC_RELAXED);
-    *freezes = (uint64_t)InterlockedExchange64(&frz_count[0], 0);
-    *fault_thaws = (uint64_t)InterlockedExchange64(&frz_count[1], 0);
-    *other_thaws = (uint64_t)InterlockedExchange64(&frz_count[2], 0) + (uint64_t)InterlockedExchange64(&frz_count[3], 0);
+    *freezes = (uint64_t)__atomic_exchange_n(&frz_count[0], 0, __ATOMIC_SEQ_CST);
+    *fault_thaws = (uint64_t)__atomic_exchange_n(&frz_count[1], 0, __ATOMIC_SEQ_CST);
+    *other_thaws = (uint64_t)__atomic_exchange_n(&frz_count[2], 0, __ATOMIC_SEQ_CST) + (uint64_t)__atomic_exchange_n(&frz_count[3], 0, __ATOMIC_SEQ_CST);
 }
 
 // The first write into a frozen region thaws it and retries. A fault in a region another thread thawed meanwhile
 // retries too; any other fault goes on to the crash handler.
-static LONG CALLBACK thaw_handler(EXCEPTION_POINTERS *ep) {
-    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
-        return EXCEPTION_CONTINUE_SEARCH;
-    uint64_t a = er->ExceptionInformation[1];
-    if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return EXCEPTION_CONTINUE_SEARCH;
-    AcquireSRWLockExclusive(&frz_lock);
+static int thaw_fault(uint64_t a) {
+    if (a >= RT_ADDRESS_LIMIT || !watched(a, 1)) return 0;
+    plat_mutex_lock(&frz_lock);
     int was = frz[a >> FRZ_SHIFT];
     thaw_locked(a >> FRZ_SHIFT, 1);
-    ReleaseSRWLockExclusive(&frz_lock);
-    if (was) return EXCEPTION_CONTINUE_EXECUTION;
-    MEMORY_BASIC_INFORMATION mbi;
-    if (VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE)
-        return EXCEPTION_CONTINUE_EXECUTION;
-    return EXCEPTION_CONTINUE_SEARCH;
+    plat_mutex_unlock(&frz_lock);
+    if (was) return 1;
+    uint64_t end;
+    return plat_mem_state(a, a + 1, &end) == PLAT_PROT_RW;
 }
 
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
-    AcquireSRWLockExclusive(&frz_lock);
+    plat_mutex_lock(&frz_lock);
     thaw_range_locked(a, n, 3);
-    int ok = !n || VirtualAlloc((void *)(uintptr_t)a, n, MEM_COMMIT, PAGE_READWRITE);
-    ReleaseSRWLockExclusive(&frz_lock);
+    int ok = !n || plat_mem_commit(a, n);
+    plat_mutex_unlock(&frz_lock);
     if (!ok)
         rt_fatal("memory: commit %s %#llx+%#llx failed (error %lu)", what, (unsigned long long)a,
-                 (unsigned long long)n, GetLastError());
+                 (unsigned long long)n, (unsigned long)plat_last_error());
 }
 
 static void decommit(uint64_t a, uint64_t n, const char *what) {
-    AcquireSRWLockExclusive(&frz_lock);
+    plat_mutex_lock(&frz_lock);
     thaw_range_locked(a, n, 3);
-    int ok = !n || VirtualFree((void *)(uintptr_t)a, n, MEM_DECOMMIT);
-    ReleaseSRWLockExclusive(&frz_lock);
+    int ok = !n || plat_mem_decommit(a, n);
+    plat_mutex_unlock(&frz_lock);
     if (!ok)
         rt_fatal("memory: decommit %s %#llx+%#llx failed (error %lu)", what, (unsigned long long)a,
-                 (unsigned long long)n, GetLastError());
+                 (unsigned long long)n, (unsigned long)plat_last_error());
 }
 
-static void protect(uint64_t a, uint64_t n, DWORD prot, const char *what) {
-    DWORD old;
-    AcquireSRWLockExclusive(&frz_lock);
+static void protect(uint64_t a, uint64_t n, int prot, const char *what) {
+    plat_mutex_lock(&frz_lock);
     thaw_range_locked(a, n, 3);
-    int ok = !n || VirtualProtect((void *)(uintptr_t)a, n, prot, &old);
-    ReleaseSRWLockExclusive(&frz_lock);
+    int ok = !n || plat_mem_protect(a, n, prot);
+    plat_mutex_unlock(&frz_lock);
     if (!ok)
         rt_fatal("memory: protect %s %#llx+%#llx failed (error %lu)", what, (unsigned long long)a,
-                 (unsigned long long)n, GetLastError());
+                 (unsigned long long)n, (unsigned long)plat_last_error());
 }
 
 // The process is re-run when a region is taken: Windows places DLLs, heaps and thread stacks at random addresses,
@@ -253,19 +232,12 @@ static void reexec_or_fail(const char *what) {
     if (n >= REEXEC_LIMIT) rt_fatal("memory: %s is not free after %d attempts", what, n);
     char buf[16];
     snprintf(buf, sizeof buf, "%d", n + 1);
-    SetEnvironmentVariableA("OOT_REEXEC", buf);
+    plat_setenv("OOT_REEXEC", buf);
     fflush(stdout);
     fflush(stderr);
-    STARTUPINFOW si = {.cb = sizeof si};
-    PROCESS_INFORMATION pi;
-    wchar_t *cmd = _wcsdup(GetCommandLineW());   // CreateProcessW may write its command line
-    if (!cmd || !CreateProcessW(NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi))
-        rt_fatal("memory: %s is not free and re-running the process failed (error %lu)", what, GetLastError());
-    CloseHandle(pi.hThread);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 70;
-    GetExitCodeProcess(pi.hProcess, &code);
-    ExitProcess(code);
+    uint32_t err = 0;
+    plat_reexec(&err);   // returns only when the new process could not be started
+    rt_fatal("memory: %s is not free and re-running the process failed (error %lu)", what, (unsigned long)err);
 }
 
 void mem_init(void) {
@@ -275,22 +247,22 @@ void mem_init(void) {
     mods_hi = align_up(rt_layout[rt_layout_count - 1].base + rt_layout[rt_layout_count - 1].size, 0x10000);
     if (mods_hi > RT_KERNEL_BASE) rt_fatal("memory: modules end at %#llx, inside the kernel region",
                                            (unsigned long long)mods_hi);
-    if (!reserve_at(mods_lo, mods_hi - mods_lo, 0)) reexec_or_fail("the module window");
-    if (!reserve_at(RT_KERNEL_BASE, RT_KERNEL_SIZE, 0)) reexec_or_fail("the kernel region");
-    if (!reserve_at(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, 0)) reexec_or_fail("the host-function window");
+    if (!plat_mem_reserve(mods_lo, mods_hi - mods_lo, 0)) reexec_or_fail("the module window");
+    if (!plat_mem_reserve(RT_KERNEL_BASE, RT_KERNEL_SIZE, 0)) reexec_or_fail("the kernel region");
+    if (!plat_mem_reserve(RT_HOSTFN_BASE, RT_HOSTFN_SIZE, 0)) reexec_or_fail("the host-function window");
 
     // Stack and heap block, then the alias region above it, both searched below the module window.
     uint64_t low = 0, alias = 0;
     for (uint64_t at = LOW_SEARCH_FROM; at + LOW_SIZE <= mods_lo && !low; at += GiB)
-        if (reserve_at(at, LOW_SIZE, MEM_WRITE_WATCH)) low = at;
+        if (plat_mem_reserve(at, LOW_SIZE, 1)) low = at;
     if (!low) reexec_or_fail("a 14 GiB stack and heap block below 2^39");
     for (uint64_t at = align_up(low + LOW_SIZE, ALIAS_ALIGN); at + ALIAS_SIZE <= mods_lo && !alias; at += ALIAS_ALIGN)
-        if (reserve_at(at, ALIAS_SIZE, MEM_WRITE_WATCH)) alias = at;
+        if (plat_mem_reserve(at, ALIAS_SIZE, 1)) alias = at;
     if (!alias) reexec_or_fail("a 64 GiB alias region below 2^39");
     shadow_next = align_up(alias + ALIAS_SIZE, GiB), shadow_end = mods_lo;
 
-    AddVectoredExceptionHandler(1, thaw_handler);   // before the crash handler
-    alias_pages = VirtualAlloc(NULL, ALIAS_PAGES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    plat_mem_fault_hook(thaw_fault);   // before the crash handler
+    alias_pages = plat_mem_alloc(ALIAS_PAGES);
     if (!alias_pages) rt_fatal("memory: cannot allocate the alias page map");
     // oot.ini is read here, once the address space is claimed and before the first setting: the pool size below
     // depends on OOT_APP_POOL and on the resolution settings (resolution.c decides them once, on this first call).
@@ -321,9 +293,9 @@ const RtGuestLayout *mem_layout(void) { return &L; }
 uint64_t mem_shadow_reserve(uint64_t size) {
     size = align_up(size, FRZ_SIZE);
     for (uint64_t at = shadow_next; at + size <= shadow_end; at += GiB)
-        if (reserve_at(at, size, MEM_WRITE_WATCH)) {
+        if (plat_mem_reserve(at, size, 1)) {
             shadow_next = align_up(at + size, GiB);
-            if (!VirtualAlloc((void *)(uintptr_t)at, size, MEM_COMMIT, PAGE_READWRITE))
+            if (!plat_mem_commit(at, size))
                 rt_fatal("memory: cannot commit %#llx bytes of virtual pool shadow", (unsigned long long)size);
             if (nshadow < 64) shadow_lo[nshadow] = at, shadow_hi[nshadow] = at + size, nshadow++;
             return at;
@@ -331,24 +303,20 @@ uint64_t mem_shadow_reserve(uint64_t size) {
     return 0;
 }
 int mem_shadow_commit(uint64_t addr, uint64_t size) {
-    return VirtualAlloc((void *)(uintptr_t)addr, size, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    return plat_mem_commit(addr, size);
 }
-void mem_shadow_release(uint64_t addr) { VirtualFree((void *)(uintptr_t)addr, 0, MEM_RELEASE); }
+void mem_shadow_release(uint64_t addr, uint64_t size) { plat_mem_release(addr, align_up(size, FRZ_SIZE)); }
 
-// Adapted from LAS Recomp runtime/platform/windows.c:40-63 @ da35b83 (MIT, Copyright (c) 2026 Peiikai): GetWriteWatch
-// with the reset flag. A range inside one watched reservation (stack and heap block, or alias region) only.
-static uint64_t written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, DWORD flags) {
+// Write watch query (plat_mem_written: GetWriteWatch on Windows, PAGEMAP_SCAN on Linux). A range inside one watched
+// reservation (stack and heap block, or alias region) only.
+static uint64_t written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max, int reset) {
     if (!max || !size) return 0;
     if (!watched(addr, size)) return UINT64_MAX;
-    ULONG_PTR n = (ULONG_PTR)max;
-    DWORD gran;
-    _Static_assert(sizeof(PVOID) == sizeof(uint64_t), "page addresses are written straight into a uint64_t array");
-    if (GetWriteWatch(flags, (void *)(uintptr_t)addr, (SIZE_T)size, (PVOID *)pages, &n, &gran)) return UINT64_MAX;
-    return n;
+    return plat_mem_written(addr, size, pages, max, reset);
 }
 
 uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
-    return written_pages(addr, size, pages, max, WRITE_WATCH_FLAG_RESET);
+    return written_pages(addr, size, pages, max, 1);
 }
 
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max) {
@@ -371,15 +339,15 @@ static int inside(uint64_t a, uint64_t n, RtRange r) { return a >= r.base && n <
 // in main), so it relies on that clean failure. An unaligned size is the caller's error (InvalidSize).
 uint32_t mem_set_heap_size(uint64_t size, uint64_t *addr) {
     if (size % 0x200000) return R_INVALID_SIZE;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     if (size > HEAP_CAP || size + image_bytes() > L.pool) {
-        ReleaseSRWLockExclusive(&lock);
+        plat_mutex_unlock(&lock);
         return R_OUT_OF_MEMORY;
     }
     if (size > heap_size) commit(L.heap.base + heap_size, size - heap_size, "heap");
     if (size < heap_size) decommit(L.heap.base + size, heap_size - size, "heap");
     heap_size = size;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     rt_log("memory: heap %#llx+%#llx (pool %#llx, images %#llx)", (unsigned long long)L.heap.base, (unsigned long long)size,
            (unsigned long long)L.pool, (unsigned long long)image_bytes());
     if (addr) *addr = L.heap.base;
@@ -428,16 +396,16 @@ uint32_t mem_set_permission(uint64_t a, uint64_t n, uint32_t perm) {
     int i = module_data(a, n);
     if (i < 0) return R_INVALID_STATE;
     const RtLoaded *m = ldr_module(i);
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
     for (uint64_t p = 0; p < n / PAGE; p++)
         if (t[p] & ATTR_PERMISSION_LOCKED) {
-            ReleaseSRWLockExclusive(&lock);
+            plat_mutex_unlock(&lock);
             return R_INVALID_STATE;
         }
     memset(t, (int)perm, n / PAGE);
-    protect(a, n, perm == PERM_RW ? PAGE_READWRITE : perm == PERM_R ? PAGE_READONLY : PAGE_NOACCESS, "module data");
-    ReleaseSRWLockExclusive(&lock);
+    protect(a, n, perm == PERM_RW ? PLAT_PROT_RW : perm == PERM_R ? PLAT_PROT_READ : PLAT_PROT_NONE, "module data");
+    plat_mutex_unlock(&lock);
     rt_log("%s data permission +%#llx size %#llx perm %u", m->name, (unsigned long long)(a - m->base),
            (unsigned long long)n, perm);
     return R_OK;
@@ -451,10 +419,10 @@ uint32_t mem_set_attribute(uint64_t a, uint64_t n, uint32_t mask, uint32_t at) {
     int i = module_data(a, n);
     if (i < 0) return R_INVALID_STATE;
     const RtLoaded *m = ldr_module(i);
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     uint8_t *t = perm_table(i) + (a - m->base - m->data_off) / PAGE;
     for (uint64_t p = 0; p < n / PAGE; p++) t[p] |= ATTR_PERMISSION_LOCKED;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     return R_OK;
 }
 
@@ -475,7 +443,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
     int in_heap = inside(src, n, (RtRange){L.heap.base, heap_size});
     int in_alias = inside(src, n, L.alias);
     if (!in_heap && !in_alias && module_data(src, n) < 0) return R_INVALID_REGION;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     uint32_t r = R_OK;
     if (in_alias && !alias_all_mapped(src, n)) {
         r = R_INVALID_REGION;
@@ -489,7 +457,7 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
             r = R_INVALID_STATE;
             goto out;
         }
-        protect(src, n, PAGE_READWRITE, "moved stack source");
+        protect(src, n, PLAT_PROT_RW, "moved stack source");
         memcpy((void *)(uintptr_t)src, (const void *)(uintptr_t)dst, n);
         decommit(dst, n, "moved stack");
         stack_maps[found] = stack_maps[--nstack_maps];
@@ -506,11 +474,11 @@ static uint32_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t n) {
             }
         commit(dst, n, "moved stack");
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, n);
-        protect(src, n, PAGE_NOACCESS, "moved stack source");
+        protect(src, n, PLAT_PROT_NONE, "moved stack source");
         stack_maps[nstack_maps++] = (StackMap){dst, src, n};
     }
 out:
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     return r;
 }
 
@@ -537,7 +505,7 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
     if (!n || ((a | n) & (PAGE - 1))) return R_INVALID_ADDRESS;
     if (!inside(a, n, L.alias)) return R_INVALID_REGION;
     uint64_t first = (a - L.alias.base) / PAGE, count = n / PAGE;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     uint32_t r = R_OK;
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
@@ -560,7 +528,7 @@ static uint32_t alias_map(int unmap, uint64_t a, uint64_t n) {
         alias_bytes += fresh * PAGE;
     }
 out:
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (r) rt_log("%sMapPhysicalMemory %#llx+%#llx failed %#x (alias %#llx used, heap %#llx)", unmap ? "Un" : "",
                   (unsigned long long)a, (unsigned long long)n, r, (unsigned long long)alias_bytes,
                   (unsigned long long)heap_size);
@@ -610,7 +578,7 @@ static uint64_t run_start(const uint8_t *p, uint64_t i, uint8_t v) {   // first 
 uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
     RtMemoryInfo r = {.base = a & ~(PAGE - 1), .size = PAGE};
     uint64_t low = L.aslr.base;
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     int mi;
     if (a >= RT_ADDRESS_LIMIT) {
         r.base = RT_ADDRESS_LIMIT;
@@ -676,7 +644,7 @@ uint32_t mem_query(uint64_t a, RtMemoryInfo *out) {
         r.base = lo;
         r.size = hi - lo;
     }
-    ReleaseSRWLockShared(&lock);
+    plat_mutex_unlock_shared(&lock);
     if (out) *out = r;
     return R_OK;
 }
@@ -693,9 +661,9 @@ int mem_info(uint32_t id, uint64_t *out) {
     case 5: v = L.heap.size; break;
     case 6: case 21: v = L.pool; break;
     case 7: case 22:
-        AcquireSRWLockShared(&lock);
+        plat_mutex_lock_shared(&lock);
         v = image_bytes() + heap_size + alias_bytes;
-        ReleaseSRWLockShared(&lock);
+        plat_mutex_unlock_shared(&lock);
         break;
     case 12: v = L.aslr.base; break;
     case 13: v = L.aslr.size; break;
@@ -726,7 +694,7 @@ int mem_info(uint32_t id, uint64_t *out) {
 typedef struct KFree { struct KFree *next; } KFree;
 static KFree *kfree_list[KCLASSES];
 static uint64_t kbump, kcommitted;
-static SRWLOCK klock = SRWLOCK_INIT;
+static PlatMutex klock = PLAT_MUTEX_INIT;
 
 static int kclass(uint64_t size) {
     int s = KMIN_SHIFT;
@@ -741,7 +709,7 @@ void *mem_kernel_alloc(uint64_t size, uint64_t align) {
     int k = kclass(want ? want : 1);
     if (k >= KCLASSES) rt_fatal("mem_kernel_alloc: %#llx bytes", (unsigned long long)size);
     uint64_t bytes = 1ull << (k + KMIN_SHIFT), al = bytes < KCOMMIT ? bytes : KCOMMIT;
-    AcquireSRWLockExclusive(&klock);
+    plat_mutex_lock(&klock);
     KFree *f = kfree_list[k];
     void *p;
     if (f) {
@@ -760,7 +728,7 @@ void *mem_kernel_alloc(uint64_t size, uint64_t align) {
         kbump = a + bytes;
         p = (void *)(uintptr_t)a;
     }
-    ReleaseSRWLockExclusive(&klock);
+    plat_mutex_unlock(&klock);
     memset(p, 0, size ? size : 1);
     return p;
 }
@@ -772,9 +740,9 @@ void mem_kernel_free(void *p, uint64_t size) {
     int k = kclass(size ? size : 1);
     // A block allocated with a larger alignment sits in a larger class; freeing it into the smaller class only
     // wastes the rest.
-    AcquireSRWLockExclusive(&klock);
+    plat_mutex_lock(&klock);
     KFree *f = p;
     f->next = kfree_list[k];
     kfree_list[k] = f;
-    ReleaseSRWLockExclusive(&klock);
+    plat_mutex_unlock(&klock);
 }

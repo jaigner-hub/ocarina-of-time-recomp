@@ -14,27 +14,28 @@
 // Side effects written after GPU completion, as MacNativeGames does: games/totk/third_party/d2r_gfx/gfx/nvn/hle_nvn.c:7-9
 // (https://github.com/ly05010419/MacNativeGames @ b75be8cfa704df3701e86130c8ced268e79d6b11, MIT, Copyright (c) 2026
 // jhaizhou; origin d2r-mobile).
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #include "gfx.h"
 #include "cfg.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "platform/platform.h"
 
 #define WEAK __attribute__((weak))
 
 typedef struct { uint64_t fence; void (*fn)(void *); void *arg; } Pending;
 typedef struct { VkCommandBuffer cb; uint64_t fence; } CmdSlot;   // reusable once the timeline reached fence
 
-static SRWLOCK start_lock = SRWLOCK_INIT;
+static PlatMutex start_lock = PLAT_MUTEX_INIT;
 static int started;
-static HANDLE completion_thread;
+static PlatThread *completion_thread;
 
 // Submissions: one at a time, so timeline values are signalled in the order they are handed out.
-static SRWLOCK sub_lock = SRWLOCK_INIT;
+static PlatMutex sub_lock = PLAT_MUTEX_INIT;
 static VkCommandPool cmd_pool;
 static CmdSlot *slots;
 static int nslots;
@@ -42,9 +43,9 @@ static int cur_slot;          // the slot vk_sync_submit records into now (an in
 static uint64_t cur_fence;    // the value of the submission being recorded
 
 // Shared with the completion thread (st_lock).
-static SRWLOCK st_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE cv_work = CONDITION_VARIABLE_INIT;   // a submission, a callback or stop
-static CONDITION_VARIABLE cv_done = CONDITION_VARIABLE_INIT;   // done advanced
+static PlatMutex st_lock = PLAT_MUTEX_INIT;
+static PlatCond cv_work = PLAT_COND_INIT;   // a submission, a callback or stop
+static PlatCond cv_done = PLAT_COND_INIT;   // done advanced
 static uint64_t issued, done;     // newest submitted value; newest value whose side effects ran
 static uint64_t reserved;         // asynchronous replay: newest value handed out before its submission (>= issued)
 static int stop;
@@ -64,7 +65,7 @@ static uint32_t ts_next;                   // submitting thread (sub_lock): next
 static volatile uint8_t ts_busy[TS_PAIRS]; // written until the completion thread read the pair
 static int ts_cur = -1;                    // the pair of the part being recorded, -1 untimed
 static uint64_t ts_last_end;               // completion thread: end of the latest part read (ticks)
-static volatile LONG64 ts_busy_ns, ts_parts, ts_missed;
+static volatile int64_t ts_busy_ns, ts_parts, ts_missed;
 
 // On the first submission that wants timing (perf_gpu_timing: OOT_TRACE=perf or the full performance overlay).
 static void ts_setup(VkCtx *c) {
@@ -104,14 +105,14 @@ static void ts_read_cb(void *arg) {   // completion thread, in submission order
         if (e >= s) {
             uint64_t from = s > ts_last_end ? s : ts_last_end;
             if (e > from) {
-                LONG64 ns = (LONG64)((double)(e - from) * ts_period);
-                InterlockedAdd64(&ts_busy_ns, ns);
+                int64_t ns = (int64_t)((double)(e - from) * ts_period);
+                __atomic_add_fetch(&ts_busy_ns, ns, __ATOMIC_SEQ_CST);
                 perf_gpu_busy((uint64_t)ns);
             }
             if (e > ts_last_end) ts_last_end = e;
-            InterlockedIncrement64(&ts_parts);
-        } else InterlockedIncrement64(&ts_missed);   // the counter wrapped
-    } else InterlockedIncrement64(&ts_missed);
+            __atomic_add_fetch(&ts_parts, 1, __ATOMIC_SEQ_CST);
+        } else __atomic_add_fetch(&ts_missed, 1, __ATOMIC_SEQ_CST);   // the counter wrapped
+    } else __atomic_add_fetch(&ts_missed, 1, __ATOMIC_SEQ_CST);
     __atomic_store_n(&ts_busy[t->pair], 0, __ATOMIC_RELEASE);
     free(t);
 }
@@ -124,7 +125,7 @@ static int ts_open(VkCommandBuffer cb) {
         if (ts_state != 1) return -1;
     }
     uint32_t p = ts_next % TS_PAIRS;
-    if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { InterlockedIncrement64(&ts_missed); return -1; }
+    if (__atomic_load_n(&ts_busy[p], __ATOMIC_ACQUIRE)) { __atomic_add_fetch(&ts_missed, 1, __ATOMIC_SEQ_CST); return -1; }
     ts_next++;
     ts_busy[p] = 1;
     vkCmdResetQueryPool(cb, ts_pool, 2 * p, 2);
@@ -159,9 +160,9 @@ static void ts_drop(void) {
 
 static void gpu_stats(PerfGpu *g) {
     g->have_gpu = ts_state == 1;
-    g->gpu_ns = (uint64_t)InterlockedExchange64(&ts_busy_ns, 0);
-    g->gpu_parts = (uint64_t)InterlockedExchange64(&ts_parts, 0);
-    g->gpu_missed = (uint64_t)InterlockedExchange64(&ts_missed, 0);
+    g->gpu_ns = (uint64_t)__atomic_exchange_n(&ts_busy_ns, 0, __ATOMIC_SEQ_CST);
+    g->gpu_parts = (uint64_t)__atomic_exchange_n(&ts_parts, 0, __ATOMIC_SEQ_CST);
+    g->gpu_missed = (uint64_t)__atomic_exchange_n(&ts_missed, 0, __ATOMIC_SEQ_CST);
     g->have_vram = vk_mem_vram(&g->vram_used, &g->vram_budget, &g->vram_exact);
 }
 
@@ -176,17 +177,17 @@ WEAK int vk_exec_record(VkCommandBuffer cb, const uint64_t *handles, int n, uint
     return 0;
 }
 
-static DWORD WINAPI completion_main(void *arg) {
+static void completion_main(void *arg) {
     VkCtx *c = arg;
-    AcquireSRWLockExclusive(&st_lock);
+    plat_mutex_lock(&st_lock);
     for (;;) {
         while (!stop && done == issued && !(qn && queue[qhead].fence <= done))
-            SleepConditionVariableSRW(&cv_work, &st_lock, INFINITE, 0);
+            plat_cond_wait(&cv_work, &st_lock);
         if (stop) break;
         uint64_t reached = done;
         if (issued > done) {
             uint64_t want = done + 1;
-            ReleaseSRWLockExclusive(&st_lock);
+            plat_mutex_unlock(&st_lock);
             VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                       .pSemaphores = &c->timeline, .pValues = &want};
             VkResult r = vkWaitSemaphores(c->device, &wi, 100000000ull);   // 100 ms: stop is checked between waits
@@ -195,31 +196,30 @@ static DWORD WINAPI completion_main(void *arg) {
                 rt_fatal("vk: vkWaitSemaphores failed (%d; device lost?)", (int)r);
             }
             vkGetSemaphoreCounterValue(c->device, c->timeline, &reached);
-            AcquireSRWLockExclusive(&st_lock);
+            plat_mutex_lock(&st_lock);
             if (reached > issued) reached = issued;
         }
         while (qn && queue[qhead].fence <= reached) {
             Pending p = queue[qhead++];
             qn--;
-            ReleaseSRWLockExclusive(&st_lock);
+            plat_mutex_unlock(&st_lock);
             p.fn(p.arg);
-            AcquireSRWLockExclusive(&st_lock);
+            plat_mutex_lock(&st_lock);
         }
         if (reached > done) {
-            ReleaseSRWLockExclusive(&st_lock);
+            plat_mutex_unlock(&st_lock);
             vk_mem_collect();
-            AcquireSRWLockExclusive(&st_lock);
+            plat_mutex_lock(&st_lock);
             __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
-            WakeAllConditionVariable(&cv_done);
+            plat_cond_broadcast(&cv_done);
         }
     }
-    ReleaseSRWLockExclusive(&st_lock);
-    return 0;
+    plat_mutex_unlock(&st_lock);
 }
 
 void vk_sync_start(void) {
     if (__atomic_load_n(&started, __ATOMIC_ACQUIRE)) return;
-    AcquireSRWLockExclusive(&start_lock);
+    plat_mutex_lock(&start_lock);
     if (!started) {
         if (!vk_init()) rt_fatal("vk: no usable Vulkan device (see the vk: lines above; OOT_GPU=null runs without a GPU)");
         VkCtx *c = vk_ctx();
@@ -237,18 +237,18 @@ void vk_sync_start(void) {
             if (vkSignalSemaphore(c->device, &si) != VK_SUCCESS) rt_fatal("vk: timeline restart at %llu", (unsigned long long)issued);
             now = issued;
         }
-        AcquireSRWLockExclusive(&st_lock);
+        plat_mutex_lock(&st_lock);
         issued = done = now;
         if (reserved < now) reserved = now;
         stop = 0;
-        ReleaseSRWLockExclusive(&st_lock);
+        plat_mutex_unlock(&st_lock);
         vk_mem_note_submit(now);
-        completion_thread = CreateThread(NULL, 0, completion_main, c, 0, NULL);
-        if (!completion_thread) rt_fatal("vk: cannot start the completion thread (error %lu)", GetLastError());
+        completion_thread = plat_thread_new(completion_main, c, "vk completion");
+        if (!completion_thread) rt_fatal("vk: cannot start the completion thread (error %u)", plat_last_error());
         __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
         vk_astc_mode();   // decides OOT_ASTC and builds the ASTC decoder now, not at the first ASTC upload
     }
-    ReleaseSRWLockExclusive(&start_lock);
+    plat_mutex_unlock(&start_lock);
 }
 
 // The index of a command buffer the GPU no longer uses, claimed for value `fence`. Called with sub_lock held; may move
@@ -327,10 +327,10 @@ VkCommandBuffer vk_sync_split(void) {
 // out in queue order and the replay thread submits them in that order, so each vk_sync_submit gets exactly its value.
 uint64_t vk_sync_reserve(void) {
     vk_sync_start();
-    AcquireSRWLockExclusive(&st_lock);
+    plat_mutex_lock(&st_lock);
     if (reserved < issued) reserved = issued;
     uint64_t v = ++reserved;
-    ReleaseSRWLockExclusive(&st_lock);
+    plat_mutex_unlock(&st_lock);
     return v;
 }
 
@@ -340,8 +340,8 @@ uint64_t vk_sync_reserve(void) {
 // freed memory (an invalid write, the device lost).
 void vk_sync_exclusive(int on) {
     vk_sync_start();
-    if (on) AcquireSRWLockExclusive(&sub_lock);
-    else ReleaseSRWLockExclusive(&sub_lock);
+    if (on) plat_mutex_lock(&sub_lock);
+    else plat_mutex_unlock(&sub_lock);
 }
 
 // OOT_GPU_DELAY=1 (an experiment): a submission is not handed to the queue at once but held until the CPU waits for a
@@ -350,7 +350,7 @@ void vk_sync_exclusive(int on) {
 // finishes writing a buffer after submitting the draw that reads it gets away with it there; here the GPU starts at
 // once. Held submissions are visible to nothing but the queue: issued, the completion thread and the fences see them
 // as submitted, so a wait for one flushes it.
-static SRWLOCK pend_lock = SRWLOCK_INIT;
+static PlatMutex pend_lock = PLAT_MUTEX_INIT;
 static struct { VkCommandBufferSubmitInfo cbi[2]; VkSemaphoreSubmitInfo sig; VkSubmitInfo2 si; uint64_t fence; } pend[64];
 static int npend, gpu_delay = -1;
 static void pend_flush_upto(uint64_t value) {   // pend_lock held
@@ -371,15 +371,15 @@ static void pend_flush_upto(uint64_t value) {   // pend_lock held
 }
 static void pend_flush(uint64_t value) {
     if (gpu_delay <= 0) return;
-    AcquireSRWLockExclusive(&pend_lock);
+    plat_mutex_lock(&pend_lock);
     pend_flush_upto(value);
-    ReleaseSRWLockExclusive(&pend_lock);
+    plat_mutex_unlock(&pend_lock);
 }
 
 uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_sync_start();
     VkCtx *c = vk_ctx();
-    AcquireSRWLockExclusive(&sub_lock);
+    plat_mutex_lock(&sub_lock);
     vk_mem_dirty_submit();   // OOT_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
@@ -421,7 +421,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
         if (gpu_delay) rt_log("vk: submissions are held until a wait needs them (OOT_GPU_DELAY)");
     }
     if (gpu_delay > 0) {
-        AcquireSRWLockExclusive(&pend_lock);
+        plat_mutex_lock(&pend_lock);
         if (npend == 64) pend_flush_upto(pend[0].fence);
         typeof(pend[0]) *e = &pend[npend++];
         memcpy(e->cbi, cbi, sizeof e->cbi);
@@ -430,7 +430,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
         e->si.pCommandBufferInfos = pro ? e->cbi : e->cbi + 1;
         e->si.pSignalSemaphoreInfos = &e->sig;
         e->fence = fence;
-        ReleaseSRWLockExclusive(&pend_lock);
+        plat_mutex_unlock(&pend_lock);
     } else {
         vk_queue_lock();
         VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
@@ -442,18 +442,18 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     }
     s->fence = recorded ? fence : 0;
     vk_mem_note_submit(fence);
-    AcquireSRWLockExclusive(&st_lock);
+    plat_mutex_lock(&st_lock);
     __atomic_store_n(&issued, fence, __ATOMIC_RELEASE);
-    WakeAllConditionVariable(&cv_work);
-    ReleaseSRWLockExclusive(&st_lock);
+    plat_cond_broadcast(&cv_work);
+    plat_mutex_unlock(&st_lock);
     static unsigned subs;
     if (++subs % 4096 == 0) rec_stats_log();
-    ReleaseSRWLockExclusive(&sub_lock);
+    plat_mutex_unlock(&sub_lock);
     return fence;
 }
 
 void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
-    AcquireSRWLockExclusive(&st_lock);
+    plat_mutex_lock(&st_lock);
     if (qhead + qn == qcap) {
         if (qhead) {
             memmove(queue, queue + qhead, sizeof *queue * (size_t)qn);
@@ -468,8 +468,8 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
     queue[qhead + qn++] = (Pending){fence, fn, arg};
     // The completion thread sleeps only while nothing is issued beyond done: a callback for a later value (the replay's,
     // for the submission it records: counter reports, freed resources) becomes due through the submit, which wakes it.
-    if (fence <= done) WakeAllConditionVariable(&cv_work);
-    ReleaseSRWLockExclusive(&st_lock);
+    if (fence <= done) plat_cond_broadcast(&cv_work);
+    plat_mutex_unlock(&st_lock);
 }
 
 static int fence_wait_impl(uint64_t value, uint64_t timeout_ns);
@@ -485,25 +485,24 @@ int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns) {
 static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
     vk_sync_start();
     pend_flush(value);   // OOT_GPU_DELAY: the held submissions this wait needs
-    AcquireSRWLockExclusive(&st_lock);
+    plat_mutex_lock(&st_lock);
     int ok;
     if (value > issued && value > reserved) {
         ok = 0;   // never submitted nor queued: never reached (as in the null back end)
     } else {
         uint64_t t0 = kern_now_ns();
         while (done < value) {
-            DWORD ms = INFINITE;
             if (timeout_ns < (1ull << 62)) {
                 uint64_t el = kern_now_ns() - t0;
                 if (el >= timeout_ns) break;
-                uint64_t left = (timeout_ns - el + 999999) / 1000000;
-                ms = left >= INFINITE ? INFINITE - 1 : (DWORD)left;
+                plat_cond_wait_ns(&cv_done, &st_lock, timeout_ns - el);
+            } else {
+                plat_cond_wait(&cv_done, &st_lock);
             }
-            SleepConditionVariableSRW(&cv_done, &st_lock, ms, 0);
         }
         ok = done >= value;
     }
-    ReleaseSRWLockExclusive(&st_lock);
+    plat_mutex_unlock(&st_lock);
     return ok;
 }
 
@@ -519,20 +518,19 @@ void vk_sync_finish(void) {
 }
 
 void vk_sync_shutdown(void) {
-    AcquireSRWLockExclusive(&start_lock);
+    plat_mutex_lock(&start_lock);
     if (started) {
         vk_sync_finish();
-        AcquireSRWLockExclusive(&st_lock);
+        plat_mutex_lock(&st_lock);
         stop = 1;
-        WakeAllConditionVariable(&cv_work);
-        ReleaseSRWLockExclusive(&st_lock);
-        WaitForSingleObject(completion_thread, INFINITE);
-        CloseHandle(completion_thread);
+        plat_cond_broadcast(&cv_work);
+        plat_mutex_unlock(&st_lock);
+        plat_thread_join(completion_thread);
         completion_thread = NULL;
-        AcquireSRWLockExclusive(&st_lock);
+        plat_mutex_lock(&st_lock);
         qhead = qn = 0;   // callbacks of values never submitted
-        ReleaseSRWLockExclusive(&st_lock);
-        AcquireSRWLockExclusive(&sub_lock);
+        plat_mutex_unlock(&st_lock);
+        plat_mutex_lock(&sub_lock);
         VkCtx *c = vk_ctx();
         if (c && cmd_pool) vkDestroyCommandPool(c->device, cmd_pool, NULL);
         perf_gpu_stats = NULL;
@@ -545,8 +543,8 @@ void vk_sync_shutdown(void) {
         free(slots);
         slots = NULL;
         nslots = 0;
-        ReleaseSRWLockExclusive(&sub_lock);
+        plat_mutex_unlock(&sub_lock);
         __atomic_store_n(&started, 0, __ATOMIC_RELEASE);
     }
-    ReleaseSRWLockExclusive(&start_lock);
+    plat_mutex_unlock(&start_lock);
 }

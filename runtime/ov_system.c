@@ -16,14 +16,17 @@
 //                                      window opens without taking focus (gfx_window.c), for scripted runs
 //   OOT_SHARED_FONTS=<dir>            nn::pl shared fonts (tools/extract_fonts.py output), default
 //                                      <romfs>/../../firmware/shared-fonts
-#include <windows.h>
-#include <bcrypt.h>
+#include <stdatomic.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>   // GetUserDefaultLocaleName only
+#endif
 
+#include "platform/platform.h"
 #include "cfg.h"
 #include "fs.h"
 #include "host.h"
@@ -33,9 +36,11 @@
 #define ACCOUNT_R_INVALID 0x7c67u          // MacNativeGames' result for an unknown user handle or uid
 #define TIME_R_INVALID 0x74u
 #define TIME_R_SOURCE_MISMATCH 0x18074u
+#define PATH_BUF 4096                      // the path buffers (MAX_PATH on Windows; longer here)
+#define LOCALE_TAG_MAX 85                  // LOCALE_NAME_MAX_LENGTH
 
 static void need(int ok, const char *what) {
-    if (!ok) rt_fatal("%s (error %lu)", what, GetLastError());
+    if (!ok) rt_fatal("%s (error %u)", what, plat_last_error());
 }
 
 static const char *caller(Cpu *c, char *buf, int n) { return ldr_describe(c->x[30] - 4, buf, n); }
@@ -43,14 +48,15 @@ static const char *caller(Cpu *c, char *buf, int n) { return ldr_describe(c->x[3
 // ==== nn::oe (services.c)
 // OOT_OPERATION_MODE, read once: 1 handheld (OperationMode 0, PerformanceMode Normal 0), 0 docked (1, Boost 1).
 int ov_handheld(void) {
-    static volatile LONG v = -1;
-    LONG h = v;
+    static atomic_long v = -1;
+    long h = atomic_load(&v);
     if (h < 0) {
         const char *e = cfg_value("OOT_OPERATION_MODE");
         if (!strcmp(e, "docked")) h = 0;
         else if (!strcmp(e, "handheld")) h = 1;
         else rt_fatal("OOT_OPERATION_MODE must be docked or handheld, not '%s'", e);
-        if (InterlockedCompareExchange(&v, h, -1) == -1)
+        long none = -1;
+        if (atomic_compare_exchange_strong(&v, &none, h))
             rt_log("oe: operation mode reported to the game: %s", h ? "handheld (performance normal)"
                                                                   : "docked (performance boost)");
     }
@@ -106,14 +112,19 @@ const char *ov_language(void) {
         rt_fatal("OOT_LANG '%s' is not a Switch language code", code);
     }
     const char *tag = cfg_get("OOT_LOCALE");
-    char sys[LOCALE_NAME_MAX_LENGTH] = "en-US";
+    char sys[LOCALE_TAG_MAX] = "en-US";
     if (!tag || !*tag) {
-        wchar_t w[LOCALE_NAME_MAX_LENGTH];
-        if (GetUserDefaultLocaleName(w, LOCALE_NAME_MAX_LENGTH)) {
+#ifdef _WIN32
+        wchar_t w[LOCALE_TAG_MAX];
+        if (GetUserDefaultLocaleName(w, LOCALE_TAG_MAX)) {
             size_t i = 0;
             for (; w[i] && w[i] < 0x80 && i + 1 < sizeof sys; i++) sys[i] = (char)w[i];
             sys[i] = 0;
         }
+#else
+        const char *u = plat_ui_language();   // the user's locale tag from LANG and friends ("" when none)
+        if (*u) snprintf(sys, sizeof sys, "%s", u);
+#endif
         tag = sys;
     }
     return switch_language(tag);
@@ -152,11 +163,11 @@ static void ov_operation_mode(Cpu *c) { ret_x(c, ov_handheld() ? 0 : 1); }
 static void ov_performance_mode(Cpu *c) { ret_x(c, ov_handheld() ? 0 : 1); }
 
 // void SetFocusHandlingMode(FocusHandlingMode mode): the nnMain checkpoint of --boot
-static volatile LONG focus_mode;
+static atomic_long focus_mode;
 static void ov_focus_mode(Cpu *c) {
     int64_t mode = (int32_t)arg_x(c, 0);
     if (mode < 0 || mode > 3) rt_fatal("nn::oe::SetFocusHandlingMode: unknown mode %lld", (long long)mode);
-    InterlockedExchange(&focus_mode, (LONG)mode);
+    atomic_store(&focus_mode, (long)mode);
     if (rt_config()->boot) {
         rt_boot_event("checkpoint", c, "SetFocusHandlingMode");
     } else {
@@ -168,28 +179,28 @@ static void ov_focus_mode(Cpu *c) {
 // FocusState GetCurrentFocusState(): 1 in focus, 2 out of focus (nn::oe::FocusState). In focus until the window
 // reports otherwise through oe_set_focus; OOT_ASSUME_FOCUS=1 (unattended runs) pins it to 1. The caller of
 // oe_set_focus also pushes OE_MSG_FOCUS_STATE_CHANGED.
-static volatile LONG focus_state = 1;
+static atomic_long focus_state = 1;
 static int assume_focus(void) {
-    static volatile LONG v = -1;
-    LONG a = v;
+    static atomic_long v = -1;
+    long a = atomic_load(&v);
     if (a < 0) {
         const char *e = cfg_get("OOT_ASSUME_FOCUS");
         a = e && atoi(e) ? 1 : 0;
-        InterlockedExchange(&v, a);
+        atomic_store(&v, a);
     }
     return (int)a;
 }
-void oe_set_focus(int in_focus) { InterlockedExchange(&focus_state, in_focus || assume_focus() ? 1 : 2); }
-static void ov_focus_state(Cpu *c) { ret_x(c, (uint64_t)focus_state); }
+void oe_set_focus(int in_focus) { atomic_store(&focus_state, in_focus || assume_focus() ? 1 : 2); }
+static void ov_focus_state(Cpu *c) { ret_x(c, (uint64_t)atomic_load(&focus_state)); }
 
-static volatile LONG notify_resume, notify_operation, notify_performance;
-static void ov_resume_enabled(Cpu *c) { InterlockedExchange(&notify_resume, (LONG)(arg_x(c, 0) & 0xff)); }
-static void ov_operation_enabled(Cpu *c) { InterlockedExchange(&notify_operation, (LONG)(arg_x(c, 0) & 0xff)); }
-static void ov_performance_enabled(Cpu *c) { InterlockedExchange(&notify_performance, (LONG)(arg_x(c, 0) & 0xff)); }
+static atomic_long notify_resume, notify_operation, notify_performance;
+static void ov_resume_enabled(Cpu *c) { atomic_store(&notify_resume, (long)(arg_x(c, 0) & 0xff)); }
+static void ov_operation_enabled(Cpu *c) { atomic_store(&notify_operation, (long)(arg_x(c, 0) & 0xff)); }
+static void ov_performance_enabled(Cpu *c) { atomic_store(&notify_performance, (long)(arg_x(c, 0) & 0xff)); }
 
 // ==== nn::oe, applet, am, prepo, nfp, err (applet_host.c)
-static SRWLOCK lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE message_cv = CONDITION_VARIABLE_INIT;
+static PlatMutex lock = PLAT_MUTEX_INIT;
+static PlatCond message_cv = PLAT_COND_INIT;
 static uint32_t messages[32];
 static unsigned head, tail;
 static float balance[2] = {1.0f, 1.0f};
@@ -197,21 +208,21 @@ static uint64_t start_ticks;
 __attribute__((constructor)) static void started(void) { start_ticks = rt_ticks(); }
 
 void oe_push_message(uint32_t message) {
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     if (tail - head < 32) {
         messages[tail++ % 32] = message;
-        WakeAllConditionVariable(&message_cv);
+        plat_cond_broadcast(&message_cv);
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // void GetExpectedVolumeBalance(float *left, float *right)
 static void ov_get_balance(Cpu *c) {
     float *l = arg_p(c, 0), *r = arg_p(c, 1);
-    AcquireSRWLockShared(&lock);
+    plat_mutex_lock_shared(&lock);
     if (l) *l = balance[0];
     if (r) *r = balance[1];
-    ReleaseSRWLockShared(&lock);
+    plat_mutex_unlock_shared(&lock);
 }
 
 // void SetExpectedVolumeBalance(float left, float right)
@@ -219,10 +230,10 @@ static void ov_set_balance(Cpu *c) {
     float l = arg_s(c, 0), r = arg_s(c, 1);
     if (!(l >= 0 && l <= 1 && r >= 0 && r <= 1))
         rt_fatal("nn::oe::SetExpectedVolumeBalance: balance %g/%g out of range", (double)l, (double)r);
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     balance[0] = l;
     balance[1] = r;
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
 }
 
 // TimeSpan GetProgramTotalActiveTime(): nanoseconds since the process started (19.2 MHz ticks * 625 / 12)
@@ -246,23 +257,23 @@ static void ov_launch_parameter(Cpu *c) {
 // bool TryPopNotificationMessage(Message *out)
 static void ov_try_pop(Cpu *c) {
     uint32_t *out = arg_p(c, 0);
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     int ok = head != tail;
     if (ok) {
         uint32_t m = messages[head++ % 32];
         if (out) *out = m;
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     ret_x(c, (uint64_t)ok);
 }
 
 // Message PopNotificationMessage(): blocks like a Horizon wait, so the thread gives its virtual core up meanwhile
 static void ov_pop(Cpu *c) {
     int away = kern_core_away();
-    AcquireSRWLockExclusive(&lock);
-    while (head == tail) SleepConditionVariableSRW(&message_cv, &lock, INFINITE, 0);
+    plat_mutex_lock(&lock);
+    while (head == tail) plat_cond_wait(&message_cv, &lock);
     uint32_t m = messages[head++ % 32];
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     kern_core_back(&away);
     ret_x(c, m);
 }
@@ -273,9 +284,9 @@ static void ov_previous_program(Cpu *c) { ret_x(c, (uint64_t)(int64_t)-1); }
 static void ov_aruid(Cpu *c) { ret_x(c, 1); }
 
 // nn::prepo: play reports stay local (no Nintendo servers)
-static volatile LONG64 reports;
+static atomic_llong reports;
 static void ov_report_save(Cpu *c) {   // Result PlayReport::Save() and Save(const account::Uid &)
-    LONG64 n = InterlockedIncrement64(&reports);
+    long long n = atomic_fetch_add(&reports, 1) + 1;
     if (n % 100 == 1) rt_log("prepo: play report kept local (not sent), %lld so far", (long long)n);
     ret_x(c, 0);
 }
@@ -297,17 +308,17 @@ static void ov_prepo_async_event(Cpu *c) {
     uint32_t hw = kern_event_new(), hr = kern_event_readable(hw);
     kern_event_signal(hw);
     rt_call(c, attach, 4, ev, (uint64_t)hr, 1ull, 0ull);   // the event owns the handle; manual clear: stays signalled
-    static volatile LONG said;
-    if (!InterlockedExchange(&said, 1)) rt_log("prepo: an async report context completes at once (no service)");
+    static atomic_int said;
+    if (!atomic_exchange(&said, 1)) rt_log("prepo: an async report context completes at once (no service)");
 }
 static void ov_prepo_async_result(Cpu *c) { ret_x(c, 0); }   // Result GetResult()
 static void ov_prepo_async_dtor(Cpu *c) { (void)c; }          // ~AsyncContext()
 
 // nn::nfp: no NFC reader
-static volatile LONG nfp_state;
-static void ov_nfp_initialize(Cpu *c) { InterlockedExchange(&nfp_state, 1); ret_x(c, 0); }
-static void ov_nfp_finalize(Cpu *c) { InterlockedExchange(&nfp_state, 0); ret_x(c, 0); }
-static void ov_nfp_state(Cpu *c) { ret_x(c, (uint64_t)nfp_state); }
+static atomic_long nfp_state;
+static void ov_nfp_initialize(Cpu *c) { atomic_store(&nfp_state, 1); ret_x(c, 0); }
+static void ov_nfp_finalize(Cpu *c) { atomic_store(&nfp_state, 0); ret_x(c, 0); }
+static void ov_nfp_state(Cpu *c) { ret_x(c, (uint64_t)atomic_load(&nfp_state)); }
 // Result ListDevices(DeviceHandle *out, int *count, int max)
 static void ov_nfp_list(Cpu *c) {
     int32_t *count = arg_p(c, 1);
@@ -377,62 +388,47 @@ static void obs_memory_pages(Cpu *c) {
 // ==== nn::account (account.c): one offline local user whose Uid survives restarts in <profile>/account.uid
 typedef struct { uint64_t lo, hi; } Uid;
 typedef struct { Uid uid; uint64_t token; } UserHandle;
-static SRWLOCK account_lock = SRWLOCK_INIT;
+static PlatMutex account_lock = PLAT_MUTEX_INIT;
 static Uid local;
 static uint64_t tokens[64], next_token = 1;
 
 static void make_dirs(const char *dir) {
-    char p[1100];
+    char p[PATH_BUF];
     need(snprintf(p, sizeof p, "%s", dir) < (int)sizeof p, "account: profile path too long");
-    for (char *s = p + 1; ; s++) {
-        char ch = *s;
-        if (ch && ch != '/' && ch != '\\') continue;
-        if (s[-1] != ':' && s[-1] != '/' && s[-1] != '\\') {
-            *s = 0;
-            wchar_t *w = fs_wide(p);
-            if (!CreateDirectoryW(w, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
-                rt_fatal("account: cannot create %s (error %lu)", p, GetLastError());
-            free(w);
-            *s = ch;
-        }
-        if (!ch) break;
-    }
+    plat_file_mkdir_p(p);
 }
 
 // Holding account_lock.
 static void load_uid(void) {
     if (local.lo || local.hi) return;
     const char *dir = rt_config()->profile;
-    char path[1100];
+    char path[PATH_BUF];
     make_dirs(dir);
     need(snprintf(path, sizeof path, "%s/account.uid", dir) < (int)sizeof path, "account: path too long");
-    wchar_t *w = fs_wide(path);
-    HANDLE f = CreateFileW(w, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    free(w);
-    if (f == INVALID_HANDLE_VALUE) rt_fatal("account: cannot open %s (error %lu)", path, GetLastError());
-    LARGE_INTEGER size;
-    DWORD n = 0;
-    need(GetFileSizeEx(f, &size), "account: size of the local account identity");
-    if (!size.QuadPart) {
-        do need(!BCryptGenRandom(NULL, (PUCHAR)&local, sizeof local, BCRYPT_USE_SYSTEM_PREFERRED_RNG), "account: random uid");
+    int64_t size = plat_file_size(path);   // -1 when missing: the identity is created, as OPEN_ALWAYS did
+    if (size <= 0) {
+        do need(plat_random(&local, sizeof local), "account: random uid");
         while (!local.lo && !local.hi);
-        need(WriteFile(f, &local, sizeof local, &n, NULL) && n == sizeof local && FlushFileBuffers(f),
+        need(plat_file_write(path, &local, sizeof local) && plat_file_flush(path),
              "account: persist the local account identity");
         rt_log("account: new local account in %s", path);
-    } else if (size.QuadPart != sizeof local || !ReadFile(f, &local, sizeof local, &n, NULL) || n != sizeof local ||
-               (!local.lo && !local.hi)) {
-        rt_fatal("account: %s is not a local account identity (16 bytes)", path);
+    } else {
+        uint64_t n = 0;
+        uint8_t *b = size == (int64_t)sizeof local ? plat_file_read(path, &n) : NULL;
+        if (!b || n != sizeof local) rt_fatal("account: %s is not a local account identity (16 bytes)", path);
+        memcpy(&local, b, sizeof local);
+        free(b);
+        if (!local.lo && !local.hi) rt_fatal("account: %s is not a local account identity (16 bytes)", path);
     }
-    CloseHandle(f);
 }
 
 // host.h: the save directory of fs_host.c is named after this Uid.
 void account_uid(uint64_t out[2]) {
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     out[0] = local.lo;
     out[1] = local.hi;
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
 }
 
 static int same_uid(const Uid *u) { return u && u->lo == local.lo && u->hi == local.hi; }
@@ -456,7 +452,7 @@ static void ov_account_initialize(Cpu *c) {
 static void ov_open_user(Cpu *c) {
     UserHandle *out = arg_p(c, 0);
     if (!out) rt_fatal("nn::account::TryOpenPreselectedUser: null handle");
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     int ok = 0;
     for (int i = 0; i < 64 && !ok; i++)
@@ -465,7 +461,7 @@ static void ov_open_user(Cpu *c) {
             *out = (UserHandle){local, tokens[i]};
             ok = 1;
         }
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
     ret_x(c, (uint64_t)ok);
 }
 
@@ -474,10 +470,10 @@ static void ov_open_user(Cpu *c) {
 static void ov_open_user_by_uid(Cpu *c) {
     const Uid *u = arg_p(c, 1);
     int known;
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     known = u && same_uid(u);
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
     if (!known) { ret_x(c, ACCOUNT_R_INVALID); return; }
     ov_open_user(c);
     ret_x(c, c->x[0] ? 0 : ACCOUNT_R_INVALID);
@@ -490,14 +486,14 @@ static void ov_list_users(Cpu *c) {
     Uid *out = arg_p(c, 1);
     int64_t max = (int32_t)arg_x(c, 2);
     if (!count) { ret_x(c, ACCOUNT_R_INVALID); return; }
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     *count = 0;
     if (out && max >= 1) {
         out[0] = local;
         *count = 1;
     }
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
     ret_x(c, 0);
 }
 
@@ -506,10 +502,10 @@ static void ov_list_users(Cpu *c) {
 static void ov_show_user_selector(Cpu *c) {
     Uid *out = arg_p(c, 0);
     if (!out) { ret_x(c, ACCOUNT_R_INVALID); return; }
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     *out = local;
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
     rt_log("account: user selector answered with the local user");
     ret_x(c, 0);
 }
@@ -517,20 +513,20 @@ static void ov_show_user_selector(Cpu *c) {
 // void CloseUser(const UserHandle &)
 static void ov_close_user(Cpu *c) {
     const UserHandle *h = arg_p(c, 0);
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     if (!valid_handle(h)) rt_fatal("nn::account::CloseUser: not an open user handle");
     for (int i = 0; i < 64; i++)
         if (tokens[i] == h->token) tokens[i] = 0;
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
 }
 
 // Result GetUserId(Uid *out, const UserHandle &)
 static void ov_user_id(Cpu *c) {
     Uid *out = arg_p(c, 0);
-    AcquireSRWLockShared(&account_lock);
+    plat_mutex_lock_shared(&account_lock);
     int ok = out && valid_handle(arg_p(c, 1));
     if (ok) *out = local;
-    ReleaseSRWLockShared(&account_lock);
+    plat_mutex_unlock_shared(&account_lock);
     ret_x(c, ok ? 0 : ACCOUNT_R_INVALID);
 }
 
@@ -539,20 +535,20 @@ static void ov_user_existence(Cpu *c) {
     uint8_t *out = arg_p(c, 0);
     const Uid *u = arg_p(c, 1);
     if (!out || !u) { ret_x(c, ACCOUNT_R_INVALID); return; }
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     *out = (uint8_t)same_uid(u);
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
     ret_x(c, 0);
 }
 
 // Result GetNickname(Nickname *out, const Uid &): 33 bytes, NUL-terminated UTF-8
 static void ov_nickname(Cpu *c) {
     char *out = arg_p(c, 0);
-    AcquireSRWLockExclusive(&account_lock);
+    plat_mutex_lock(&account_lock);
     load_uid();
     int ok = out && same_uid(arg_p(c, 1));
-    ReleaseSRWLockExclusive(&account_lock);
+    plat_mutex_unlock(&account_lock);
     if (ok) {
         memset(out, 0, 33);
         memcpy(out, "Local", 5);
@@ -581,19 +577,44 @@ _Static_assert(sizeof(SteadyClockTimePoint) == 0x18 && sizeof(CalendarTime) == 8
 _Static_assert(sizeof(ClockSnapshot) == 0xd0, "nn::time::ClockSnapshot");
 
 static uint8_t source_id[16];
-static volatile LONG time_ready;
-static INIT_ONCE source_once = INIT_ONCE_STATIC_INIT;
+static atomic_long time_ready;
+static atomic_int source_done;
+static PlatMutex source_lock = PLAT_MUTEX_INIT;   // callers wait for the first set-up to finish, as InitOnce did
 
-static BOOL CALLBACK make_source(PINIT_ONCE once, PVOID param, PVOID *ctx) {
-    (void)once, (void)param, (void)ctx;
-    need(!BCryptGenRandom(NULL, source_id, sizeof source_id, BCRYPT_USE_SYSTEM_PREFERRED_RNG), "time: source id");
-    _tzset();
-    return TRUE;
+// The source id (one per process) and the time zone, set up on first use.
+static void ensure_source(void) {
+    if (atomic_load_explicit(&source_done, memory_order_acquire)) return;
+    plat_mutex_lock(&source_lock);
+    if (!atomic_load(&source_done)) {
+        need(plat_random(source_id, sizeof source_id), "time: source id");
+        tzset();
+        atomic_store_explicit(&source_done, 1, memory_order_release);
+    }
+    plat_mutex_unlock(&source_lock);
+}
+
+// localtime for the host zone, 0 when t does not fit a struct tm; the zone's offset west of UTC in seconds.
+static int local_tm(time_t t, struct tm *tm) {
+#ifdef _WIN32
+    return localtime_s(tm, &t) == 0;
+#else
+    return localtime_r(&t, tm) != NULL;
+#endif
+}
+static long zone_west(void) {
+#ifdef _WIN32
+    long west = 0;
+    _get_timezone(&west);
+    return west;
+#else
+    tzset();
+    return timezone;
+#endif
 }
 
 static SteadyClockTimePoint steady_now(void) {
-    InitOnceExecuteOnce(&source_once, make_source, NULL, NULL);
-    SteadyClockTimePoint p = {(int64_t)(GetTickCount64() / 1000), {0}};
+    ensure_source();
+    SteadyClockTimePoint p = {(int64_t)(plat_tick_ms() / 1000), {0}};
     memcpy(p.source, source_id, 16);
     return p;
 }
@@ -643,10 +664,10 @@ static int utc_calendar(int64_t t, CalendarTime *c, CalendarInfo *info) {
 // Local calendar fields of a POSIX time in the Windows time zone. The zone name is "UTC" or the UTC offset ("+03",
 // "-0330"), as tzdata names zones without an abbreviation; Windows has no abbreviations. 0 outside localtime_s' range.
 static int local_calendar(int64_t t, CalendarTime *c, CalendarInfo *info) {
-    InitOnceExecuteOnce(&source_once, make_source, NULL, NULL);
+    ensure_source();
     time_t tt = (time_t)t;
     struct tm tm;
-    if (localtime_s(&tm, &tt)) return 0;
+    if (!local_tm(tt, &tm)) return 0;
     int64_t as_utc = days_from_civil(tm.tm_year + 1900, (unsigned)tm.tm_mon + 1, (unsigned)tm.tm_mday) * 86400 +
                      tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec;
     int32_t offset = (int32_t)(as_utc - t);
@@ -668,20 +689,19 @@ static int local_calendar(int64_t t, CalendarTime *c, CalendarInfo *info) {
 
 // IANA name of the standard offset: Etc/GMT+5 is UTC-5 (POSIX sign); "UTC" for a zone off whole hours.
 static void location_name(char out[0x24]) {
-    long west = 0;
     memset(out, 0, 0x24);
-    _get_timezone(&west);
+    long west = zone_west();
     if (!west || west % 3600) snprintf(out, 0x24, "UTC");
     else snprintf(out, 0x24, "Etc/GMT%+ld", west / 3600);
 }
 
 static void ov_time_initialize(Cpu *c) {
-    InitOnceExecuteOnce(&source_once, make_source, NULL, NULL);
-    InterlockedExchange(&time_ready, 1);
+    ensure_source();
+    atomic_store(&time_ready, 1);
     ret_x(c, 0);
 }
-static void ov_time_finalize(Cpu *c) { InterlockedExchange(&time_ready, 0); ret_x(c, 0); }
-static void ov_time_ready(Cpu *c) { ret_x(c, (uint64_t)time_ready); }
+static void ov_time_finalize(Cpu *c) { atomic_store(&time_ready, 0); ret_x(c, 0); }
+static void ov_time_ready(Cpu *c) { ret_x(c, (uint64_t)atomic_load(&time_ready)); }
 
 // Result StandardUserSystemClock / StandardNetworkSystemClock::GetCurrentTime(PosixTime *out)
 static void ov_current_time(Cpu *c) {
@@ -786,18 +806,20 @@ static void ov_user_difference(Cpu *c) {
 static const char *const font_files[SHARED_FONT_TYPES] = {
     "0-standard.bfttf", "1-chinese-simplified.bfttf", "2-chinese-simplified-extension.bfttf",
     "3-chinese-traditional.bfttf", "4-korean.bfttf", "5-nintendo-extension.bfttf"};
-static struct { SRWLOCK lock; const uint8_t *file[SHARED_FONT_TYPES]; uint64_t size[SHARED_FONT_TYPES]; } fonts;
+static struct { PlatMutex lock; const uint8_t *file[SHARED_FONT_TYPES]; uint64_t size[SHARED_FONT_TYPES]; } fonts;
 
 const char *ov_shared_font_dir(char *buf, size_t n) {
     const char *e = cfg_get("OOT_SHARED_FONTS");
     if (e && *e) snprintf(buf, n, "%s", e);
     else {
-        char exe[MAX_PATH], probe[MAX_PATH + 40];   // shared-fonts next to oot.exe (tools/package_build.py), else the repo's
-        DWORD len = GetModuleFileNameA(NULL, exe, sizeof exe);
-        char *cut = len && len < sizeof exe ? strrchr(exe, '\\') : NULL;
+        char exe[PATH_BUF], probe[PATH_BUF + 40];   // shared-fonts next to the executable (tools/package_build.py), else the repo's
+        char *cut = NULL;
+        if (plat_exe_path(exe, sizeof exe))
+            for (char *q = exe; *q; q++)
+                if (*q == '/' || *q == '\\') cut = q;
         if (cut) *cut = 0;
-        snprintf(probe, sizeof probe, "%s\\shared-fonts\\0-standard.bfttf", exe);
-        if (cut && GetFileAttributesA(probe) != INVALID_FILE_ATTRIBUTES) snprintf(buf, n, "%s\\shared-fonts", exe);
+        snprintf(probe, sizeof probe, "%s/shared-fonts/0-standard.bfttf", exe);
+        if (cut && plat_file_exists(probe)) snprintf(buf, n, "%s/shared-fonts", exe);
         else snprintf(buf, n, "%s/../../firmware/shared-fonts", rt_config()->romfs);
     }
     return buf;
@@ -824,18 +846,18 @@ static void ov_font_state(Cpu *c) { font_type(c, "GetSharedFontLoadState"); ret_
 
 // The font of type t, read and checked on first use; a named fatal when it is missing or damaged.
 static const uint8_t *font_data(Cpu *c, const char *fn, int64_t t) {
-    AcquireSRWLockExclusive(&fonts.lock);
+    plat_mutex_lock(&fonts.lock);
     if (!fonts.file[t]) {
-        char dir[MAX_PATH], path[MAX_PATH + 64], lr[96];
+        char dir[PATH_BUF], path[PATH_BUF + 64], lr[96];
         snprintf(path, sizeof path, "%s/%s", ov_shared_font_dir(dir, sizeof dir), font_files[t]);
         FILE *f = fopen(path, "rb");
         if (!f)
             rt_fatal("nn::pl::%s(%lld) from %s: no shared font %s (needed for Chinese and Korean text); run "
                      "tools/extract_fonts.py --firmware <firmware NCA dir> or set OOT_SHARED_FONTS", fn, (long long)t,
                      caller(c, lr, sizeof lr), path);
-        _fseeki64(f, 0, SEEK_END);
-        int64_t len = _ftelli64(f);
-        _fseeki64(f, 0, SEEK_SET);
+        fseek(f, 0, SEEK_END);
+        int64_t len = ftell(f);
+        fseek(f, 0, SEEK_SET);
         if (len < 12 || len > (64 << 20)) rt_fatal("nn::pl: shared font %s: size %lld", path, (long long)len);
         uint8_t *p = mem_kernel_alloc((uint64_t)len, 16);
         size_t got = fread(p, 1, (size_t)len, f);
@@ -848,7 +870,7 @@ static const uint8_t *font_data(Cpu *c, const char *fn, int64_t t) {
                (unsigned long long)size, path);
     }
     const uint8_t *p = fonts.file[t];
-    ReleaseSRWLockExclusive(&fonts.lock);
+    plat_mutex_unlock(&fonts.lock);
     return p;
 }
 static void ov_font_address(Cpu *c) {

@@ -8,10 +8,10 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
 
 #include "gfx.h"
 #include "host.h"
+#include "platform/platform.h"
 
 // The strong nvnp_nvnDeviceGetProcAddress below replaces the stand-in generated for the same row.
 #define nvnp_nvnDeviceGetProcAddress nvnp_stub_nvnDeviceGetProcAddress
@@ -34,8 +34,8 @@ void nvnp_nvnDeviceGetProcAddress(Cpu *c);
 // the caller and the first arguments and returns 0, so the game runs on and the log shows which procs it uses.
 #define NVN_STUB(n)                                                                                                  \
     static void nvnp_stub_##n(Cpu *c) {                                                                               \
-        static volatile LONG seen;                                                                                   \
-        LONG k = InterlockedIncrement(&seen);                                                                         \
+        static volatile int32_t seen;                                                                                   \
+        int32_t k = __atomic_add_fetch(&seen, 1, __ATOMIC_SEQ_CST);                                                                         \
         char at[128];                                                                                                \
         if (k <= 3) rt_log("nvn2 stub " #n " from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx (returns 0)",                \
                            ldr_describe(c->x[30] - 4, at, sizeof at), (unsigned long long)c->x[0],                      \
@@ -76,10 +76,10 @@ uint64_t nvn_proc_address(const char *name) {
     const Proc *p = bsearch(&(Proc){name, 0}, procs, (size_t)nprocs, sizeof *procs, by_name);
     if (p) return p->addr;
     // Unknown names get NULL, as on hardware; each distinct one is logged once.
-    static SRWLOCK lock = SRWLOCK_INIT;
+    static PlatMutex lock = PLAT_MUTEX_INIT;
     static char seen[256][96];
     static int nseen;
-    AcquireSRWLockExclusive(&lock);
+    plat_mutex_lock(&lock);
     int fresh = 1;
     for (int i = 0; i < nseen; i++)
         if (!strncmp(seen[i], name, sizeof seen[i] - 1)) fresh = 0;
@@ -89,7 +89,7 @@ uint64_t nvn_proc_address(const char *name) {
     } else {
         fresh = 0;
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_mutex_unlock(&lock);
     if (fresh) rt_log("nvn: no such proc \"%s\", returning NULL", name);
     return 0;
 }
