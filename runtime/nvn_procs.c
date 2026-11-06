@@ -40,6 +40,8 @@ void nvnp_nvnDeviceGetProcAddress(Cpu *c);
         if (k <= 3) rt_log("nvn2 stub " #n " from %s: x0 %#llx x1 %#llx x2 %#llx x3 %#llx (returns 0)",                \
                            ldr_describe(c->x[30] - 4, at, sizeof at), (unsigned long long)c->x[0],                      \
                            (unsigned long long)c->x[1], (unsigned long long)c->x[2], (unsigned long long)c->x[3]);      \
+        else if (k == 10 || k == 100 || k == 1000 || k == 10000 || k == 100000 || k == 1000000)                       \
+            rt_log("nvn2 stub " #n ": %ld calls", (long)k); /* how often a stubbed call is made, by order of size */ \
         ret_x(c, 0);                                                                                                 \
     }
 #include "nvn_procs_stub.inc"

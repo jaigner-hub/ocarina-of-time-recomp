@@ -2275,9 +2275,33 @@ static Fiber *fiber_find(uint64_t addr) {
 
 static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to);
 
+// The guest thread running this host thread now. A guest fiber may resume on another host thread than the one it
+// left (SDK 22's nn::async coordinator yields with SwitchToFiber(nullptr) and another worker picks the fiber up),
+// but LLVM takes a thread-local's address as fixed within a function: fiber_main kept &tcur of the thread it started
+// on in a callee-saved register across rt_call, and a fiber that had moved on switched, when it returned, to the base
+// fiber of the thread it started on, which that thread was running: two host threads on one stack (the start-up
+// crash, about one run in two). Out of line, so every read after a switch computes the address again.
+static __attribute__((noinline)) RtThread *tcur_now(void) { return tcur; }
+
+// OOT_FIBER_LOG=1: a line per fiber operation (the first FIBER_LOG_N), with the guest thread, its host thread and the
+// fiber it was on, for following a fiber across threads.
+#define FIBER_LOG_N 4000
+static int g_fiber_log = -1, g_fiber_logged;
+static void fiber_log(const char *op, uint64_t addr, const Fiber *f) {
+    if (g_fiber_log < 0) {
+        const char *e = cfg_get("OOT_FIBER_LOG");
+        g_fiber_log = e && *e && strcmp(e, "0");
+    }
+    if (!g_fiber_log || __atomic_fetch_add(&g_fiber_logged, 1, __ATOMIC_RELAXED) >= FIBER_LOG_N) return;
+    RtThread *t = tcur;
+    rt_log("fiber: %s %#llx on thread %#x (host %lu, was on %#llx)%s%s", op, (unsigned long long)addr,
+           t ? t->handle : 0, GetCurrentThreadId(), (unsigned long long)(t && t->fiber ? t->fiber->addr : 0),
+           f && f->running ? " running" : "", f ? (f->state == F_NEW ? " new" : f->state == F_DONE ? " done" : "") : "");
+}
+
 // After a host fiber switch: release the context left behind, and finish an ExitThread issued on a fiber.
 static void fiber_resumed(void) {
-    RtThread *t = tcur;
+    RtThread *t = tcur_now();
     rt_fpcr_sync(t->cur);   // the host fiber resumes with its own MXCSR (FIBER_FLAG_FLOAT_SWITCH)
     if (t->leaving) {
         __atomic_store_n(&t->leaving->running, 0, __ATOMIC_RELEASE);
@@ -2290,14 +2314,15 @@ static void WINAPI fiber_main(void *p) {
     Fiber *f = p;
     fiber_resumed();
     Cpu *c = f->cpu;
-    tcur->host_depth = 0;   // a new fiber starts at the top level; each context restores its own depth on resume
+    tcur_now()->host_depth = 0;   // a new fiber starts at the top level; each context restores its own depth on resume
     uint64_t next = rt_call(c, f->func, 1, f->arg);
     f->state = F_DONE;
+    fiber_log("returned", f->addr, f);
     Fiber *n = NULL;
     if (next && !(n = fiber_find(next)))
         rt_fatal("fiber %#llx returned %#llx, which is not an initialized fiber", (unsigned long long)f->addr,
                  (unsigned long long)next);
-    fiber_switch_to(tcur, c, n);   // NULL: back to the thread's own context
+    fiber_switch_to(tcur_now(), c, n);   // NULL: back to the context of the thread the fiber ends on
     rt_fatal("fiber %#llx resumed after it finished", (unsigned long long)f->addr);
 }
 
@@ -2328,7 +2353,7 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
     t->cur = dst;
     int depth = t->host_depth;
     SwitchToFiber(to ? to->host : t->base_fiber);
-    t->host_depth = depth;
+    tcur_now()->host_depth = depth;   // this context's depth, on whichever thread resumed it (t may be another)
     fiber_resumed();
 }
 
@@ -2336,6 +2361,7 @@ static void fiber_switch_to(RtThread *t, const Cpu *from, Fiber *to) {
 void kern_fiber_initialize(Cpu *c) {
     uint64_t addr = c->x[0];
     Fiber *f = fiber_find(addr);
+    fiber_log("initialize", addr, f);
     if (f && f->running) rt_fatal("InitializeFiber(%#llx): the fiber is running", (unsigned long long)addr);
     if (!f) {
         f = calloc(1, sizeof *f);
@@ -2375,6 +2401,7 @@ void kern_fiber_finalize(Cpu *c) {
             g_fibers[i] = NULL;
         }
     ReleaseSRWLockExclusive(&g_fiber_lock);
+    fiber_log("finalize", addr, f);
     if (!f) rt_fatal("FinalizeFiber(%#llx): not an initialized fiber", (unsigned long long)addr);
     if (f->running) rt_fatal("FinalizeFiber(%#llx): the fiber is running", (unsigned long long)addr);
     DeleteFiber(f->host);
@@ -2386,6 +2413,7 @@ void kern_fiber_finalize(Cpu *c) {
 void kern_fiber_switch(Cpu *c) {
     RtThread *t = tcur;
     if (!t) rt_fatal("SwitchToFiber on a host thread");
+    fiber_log("switch to", c->x[0], c->x[0] ? fiber_find(c->x[0]) : NULL);
     if (!c->x[0]) {   // SDK 22 (OoT): nn::async's fiber task coordinator yields with SwitchToFiber(nullptr), back to the thread's own context
         if (t->fiber) fiber_switch_to(t, c, NULL);
         return;

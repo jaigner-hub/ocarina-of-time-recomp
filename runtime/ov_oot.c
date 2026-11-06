@@ -174,6 +174,50 @@ static void obs_abort_impl(Cpu *c) {
 }
 HOST_OBSERVER("_ZN2nn4diag6detail9AbortImplEPKcS3_S3_i", obs_abort_impl);
 
+static int guest_ok(uint64_t a, uint64_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!a || !VirtualQuery((void *)(uintptr_t)a, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return a + n <= (uint64_t)(uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+}
+
+// nn::diag::detail::AbortImpl(), the argument-less form, which the SDK reaches through its own PLT. The start-up
+// abort comes here from nn::os::detail::MultiWaitImpl::InternalWaitAnyImpl (sdk+0x167be0, call at sdk+0x167ec4)
+// when its holders hand back more native handles than WaitSynchronization takes (0x40 less those the caller passed).
+// The holders are then listed by vtable: x20 is the MultiWaitImpl, a circular list of nodes at +8 (next at +8) whose
+// holder is the node's address - 8.
+#define WAITANY_ABORT_LR 0x7005367ec8ull
+static void obs_abort_impl0(Cpu *c) {
+    char lr[128];
+    rt_log("nn::diag abort (no message), from %s", ldr_describe(c->x[30] - 4, lr, sizeof lr));
+    if (c->x[30] == WAITANY_ABORT_LR) {
+        uint64_t head = c->x[20];
+        struct { uint64_t vt, fn; int n; } kinds[32];
+        int nk = 0, total = 0;
+        uint64_t node = guest_ok(head + 8, 8) ? *(uint64_t *)(uintptr_t)(head + 8) : 0;
+        while (node && node != head && total < 4096 && guest_ok(node - 8, 16)) {
+            uint64_t vt = *(uint64_t *)(uintptr_t)(node - 8);
+            uint64_t fn = guest_ok(vt + 0x18, 8) ? *(uint64_t *)(uintptr_t)(vt + 0x18) : 0;
+            int k = 0;
+            while (k < nk && kinds[k].vt != vt) k++;
+            if (k == nk && nk < 32) kinds[nk++] = (typeof(kinds[0])){vt, fn, 0};
+            if (k < nk) kinds[k].n++;
+            total++;
+            node = *(uint64_t *)(uintptr_t)node;
+        }
+        rt_log("nn::os MultiWait %#llx: %d holders (caller's handles %d, x27 %u, x26 %u)", (unsigned long long)head,
+               total, (int)c->x[9], (uint32_t)c->x[27], (uint32_t)c->x[26]);
+        for (int k = 0; k < nk; k++) {
+            char v[128], f[128];
+            rt_log("  %4d x vtable %s, +0x18 %s", kinds[k].n, ldr_describe(kinds[k].vt, v, sizeof v),
+                   ldr_describe(kinds[k].fn, f, sizeof f));
+        }
+    }
+    fflush(stderr);
+    rt_original(c);
+}
+HOST_OBSERVER("_ZN2nn4diag6detail9AbortImplEv", obs_abort_impl0);
+
 // nn::ssl: Initialize succeeds without ssl:s; making a context or reading the built-in certificates fails with an
 // ssl-module result (module 123). Context's constructor and destructor are local SDK code and stay lifted.
 #define SSL_R_UNAVAILABLE (123u | (1u << 9))

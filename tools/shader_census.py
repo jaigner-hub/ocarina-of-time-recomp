@@ -302,9 +302,11 @@ def lower(programs, out):
     exe = build_lowerer(out)
     low = out / 'lowered'
     low.mkdir(exist_ok=True)
-    request = ''.join(f'{key} {p["stage"]} {out / "ctl" / (key + ".ctl")} {out / "code" / (key + ".code")} '
-                      f'{low / (key + ".code")} {low / (key + ".c1")}\n' for key, p in sorted(programs.items()))
-    r = subprocess.run([str(exe), '--batch'], input=request, capture_output=True, text=True)
+    # Paths relative to out, where the helper runs: the request is split at spaces, and the repository's path may
+    # hold one.
+    request = ''.join(f'{key} {p["stage"]} ctl/{key}.ctl code/{key}.code lowered/{key}.code lowered/{key}.c1\n'
+                      for key, p in sorted(programs.items()))
+    r = subprocess.run([str(exe), '--batch'], input=request, capture_output=True, text=True, cwd=out)
     ok, failures = 0, {}
     for line in r.stdout.splitlines():
         parts = line.split(' ', 3)
