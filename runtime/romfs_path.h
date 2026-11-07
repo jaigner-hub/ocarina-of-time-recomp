@@ -21,14 +21,25 @@ static inline int romfs_path_valid_relative(const char *path) {
     return 1;
 }
 
-// "<mount>:/<path>" -> "<path>", or NULL. Audio stream requests join a mount root and a leading-slash resource,
-// producing "content://Sound/...": repeated root separators are skipped; traversal, backslashes and empty interior
-// components are still rejected.
+// "<mount>:/<path>" -> "<path>", or NULL. Audio stream requests join a mount root and a leading-slash resource.
+// The sound streams make "content://Sound/..." (repeated root separators) and the voice streams make
+// "content://Voice/Resource//Stream/..." (a repeated separator inside the path): nn::fs accepts both, so every run
+// of separators counts as one. Traversal ("." and ".."), backslashes and an empty path are still rejected. A path with
+// a repeated interior separator comes back in a per-thread buffer, valid until the thread's next call.
 static inline const char *romfs_path_relative(const char *mount, const char *path) {
     if (!mount || !*mount || !path) return NULL;
     size_t size = strlen(mount);
     if (strncmp(path, mount, size) || path[size] != ':' || path[size + 1] != '/') return NULL;
     path += size + 2;
     while (*path == '/') ++path;
-    return romfs_path_valid_relative(path) ? path : NULL;
+    if (!strstr(path, "//")) return romfs_path_valid_relative(path) ? path : NULL;
+    static _Thread_local char collapsed[1024];
+    size_t n = 0;
+    for (const char *s = path; *s; s++) {
+        if (*s == '/' && s[1] == '/') continue;
+        if (n + 1 >= sizeof collapsed) return NULL;
+        collapsed[n++] = *s;
+    }
+    collapsed[n] = 0;
+    return romfs_path_valid_relative(collapsed) ? collapsed : NULL;
 }

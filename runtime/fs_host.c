@@ -1345,10 +1345,12 @@ static void probe_paths(void) {
     static const struct { const char *path, *want; } cases[] = {
         {"rom:/a/b.bin", "a/b.bin"}, {"rom://a/b.bin", "a/b.bin"}, {"rom:///a/b.bin", "a/b.bin"},
         {"rom:/a", "a"},             {"rom:/../main", NULL},       {"rom://../a", NULL},
-        {"rom:/a/../b", NULL},       {"rom:/a/./b", NULL},         {"rom:/a//b", NULL},
+        {"rom:/a/../b", NULL},       {"rom:/a/./b", NULL},         {"rom:/a//b", "a/b"},
         {"rom:/a\\b", NULL},         {"rom:/", NULL},              {"rom://", NULL},
         {"rom:a", NULL},             {"ro:/a", NULL},              {"romx:/a", NULL},
         {"rom:/.", NULL},            {"rom:/..", NULL},            {"ROM:/a", NULL},
+        {"rom://Voice/Resource//Stream/x.bwav", "Voice/Resource/Stream/x.bwav"}, {"rom:/a///b//c", "a/b/c"},
+        {"rom:/a//../b", NULL},      {"rom:/a//./b", NULL},
     };
     int bad = 0;
     for (unsigned i = 0; i < sizeof cases / sizeof *cases; i++) {
