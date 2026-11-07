@@ -47,7 +47,68 @@ static CONDITION_VARIABLE cv_work = CONDITION_VARIABLE_INIT;   // a submission, 
 static CONDITION_VARIABLE cv_done = CONDITION_VARIABLE_INIT;   // done advanced
 static uint64_t issued, done;     // newest submitted value; newest value whose side effects ran
 static uint64_t reserved;         // asynchronous replay: newest value handed out before its submission (>= issued)
-static int stop;
+
+static int stop;                  // set by vk_sync_shutdown, checked by the threads
+
+// ---- OOT_FENCE_TRACE=1 (diagnostic): the completion thread's stage, so a stall says who is blocked.
+// ft_stage: 0 idle, 1 inside a completion callback, 2 inside vk_mem_collect, 3 inside the timeline wait.
+static int ftrace = -1;
+static volatile LONG64 ft_stage, ft_last_cb, ft_waits, ft_cur_fence;
+static void ft_init(void) {
+    if (ftrace >= 0) return;
+    const char *e = cfg_get("OOT_FENCE_TRACE");
+    ftrace = e && *e && *e != '0';
+    if (ftrace) {
+        extern int vk_exec_trace_on;   // vk_exec.c
+        vk_exec_trace_on = 1;
+        rt_log("fence: trace on (OOT_FENCE_TRACE)");
+    }
+}
+static void ft_set(int stage) { if (ftrace > 0) __atomic_store_n(&ft_stage, stage, __ATOMIC_RELEASE); }
+static volatile LONG64 ft_cstage;   // the completion thread's own stage: it polls the timeline every 100 ms and must not
+                                    // overwrite the submit path's stage, which is what a stall needs to show
+static void ft_cset(int stage) { if (ftrace > 0) __atomic_store_n(&ft_cstage, stage, __ATOMIC_RELEASE); }
+
+// Says, once a second, what the completion thread is doing while `done` stops advancing behind `issued`.
+// Also prints a heartbeat every 5 s, so a stall shows the stage the submit path is stuck in.
+static DWORD WINAPI ft_watch_main(void *arg) {
+    VkCtx *c = arg;
+    uint64_t last = 0;
+    int still = 0, beat = 0;
+    for (;;) {
+        Sleep(1000);
+        if (__atomic_load_n(&stop, __ATOMIC_ACQUIRE)) return 0;
+        uint64_t d = __atomic_load_n(&done, __ATOMIC_ACQUIRE), i = __atomic_load_n(&issued, __ATOMIC_ACQUIRE);
+        if (d == last && i > d) {
+            if (++still == 2) {
+                uint64_t tl = 0;
+                vkGetSemaphoreCounterValue(c->device, c->timeline, &tl);
+                rt_log("fence: STALL done=%llu issued=%llu timeline=%llu stage=%lld last_cb=%lld waits=%lld",
+                       (unsigned long long)d, (unsigned long long)i, (unsigned long long)tl,
+                       (long long)__atomic_load_n(&ft_stage, __ATOMIC_ACQUIRE),
+                       (long long)__atomic_load_n(&ft_last_cb, __ATOMIC_ACQUIRE),
+                       (long long)__atomic_load_n(&ft_waits, __ATOMIC_ACQUIRE));
+            }
+        } else {
+            still = 0;
+        }
+        if (++beat >= 5) {   // heartbeat: stage 4+ means a submit holds sub_lock
+            beat = 0;
+            uint64_t tl = 0;
+            vkGetSemaphoreCounterValue(c->device, c->timeline, &tl);
+            extern volatile LONG64 vk_exec_cur_op;   // vk_exec.c
+            long long op = __atomic_load_n(&vk_exec_cur_op, __ATOMIC_RELAXED);
+            rt_log("fence: hb done=%llu issued=%llu timeline=%llu stage=%lld cstage=%lld cur=%lld op=%s(%lld) waits=%lld",
+                   (unsigned long long)d, (unsigned long long)i, (unsigned long long)tl,
+                   (long long)__atomic_load_n(&ft_stage, __ATOMIC_ACQUIRE),
+                   (long long)__atomic_load_n(&ft_cstage, __ATOMIC_ACQUIRE),
+                   (long long)__atomic_load_n(&ft_cur_fence, __ATOMIC_ACQUIRE),
+                   nvn_op_name(op < 0 ? 0xffffffffu : (uint32_t)op), op,
+                   (long long)__atomic_load_n(&ft_waits, __ATOMIC_ACQUIRE));
+        }
+        last = d;
+    }
+}
 static Pending *queue;            // side effects in the order they were added
 static int qhead, qn, qcap;
 
@@ -187,9 +248,11 @@ static DWORD WINAPI completion_main(void *arg) {
         if (issued > done) {
             uint64_t want = done + 1;
             ReleaseSRWLockExclusive(&st_lock);
+            ft_cset(3);   // OOT_FENCE_TRACE: waiting on the timeline
             VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
                                       .pSemaphores = &c->timeline, .pValues = &want};
             VkResult r = vkWaitSemaphores(c->device, &wi, 100000000ull);   // 100 ms: stop is checked between waits
+            ft_cset(0);
             if (r != VK_SUCCESS && r != VK_TIMEOUT) {
                 vk_device_fault_report(r);
                 rt_fatal("vk: vkWaitSemaphores failed (%d; device lost?)", (int)r);
@@ -202,12 +265,19 @@ static DWORD WINAPI completion_main(void *arg) {
             Pending p = queue[qhead++];
             qn--;
             ReleaseSRWLockExclusive(&st_lock);
+            if (ftrace > 0) {
+                __atomic_store_n(&ft_last_cb, (long long)p.fence, __ATOMIC_RELEASE);
+                ft_cset(1);
+            }
             p.fn(p.arg);
+            ft_cset(0);
             AcquireSRWLockExclusive(&st_lock);
         }
         if (reached > done) {
             ReleaseSRWLockExclusive(&st_lock);
+            ft_cset(2);
             vk_mem_collect();
+            ft_cset(0);
             AcquireSRWLockExclusive(&st_lock);
             __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
             WakeAllConditionVariable(&cv_done);
@@ -245,6 +315,8 @@ void vk_sync_start(void) {
         vk_mem_note_submit(now);
         completion_thread = CreateThread(NULL, 0, completion_main, c, 0, NULL);
         if (!completion_thread) rt_fatal("vk: cannot start the completion thread (error %lu)", GetLastError());
+        ft_init();   // OOT_FENCE_TRACE: after `c` exists, before the first submit
+        if (ftrace > 0) CreateThread(NULL, 0, ft_watch_main, c, 0, NULL);
         __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
         vk_astc_mode();   // decides OOT_ASTC and builds the ASTC decoder now, not at the first ASTC upload
     }
@@ -380,9 +452,11 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_sync_start();
     VkCtx *c = vk_ctx();
     AcquireSRWLockExclusive(&sub_lock);
+    ft_set(4);   // OOT_FENCE_TRACE: sub_lock held; a stall at 4 blocks every other submit
     vk_mem_dirty_submit();   // OOT_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
     cur_fence = fence;
+    if (ftrace > 0) __atomic_store_n(&ft_cur_fence, (long long)fence, __ATOMIC_RELEASE);
     // Noted before the recording, not after the submit: an object another thread releases while this submission is
     // recorded (a texture replaced at its address, a sweep of released textures) may be named by it, and deferred
     // destruction (vk_memory.c collect_locked) must then wait for this fence, not the previous one. FE3H's battles
@@ -396,7 +470,9 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
+    ft_set(5);   // recording
     int recorded = vk_exec_record(s->cb, handles, n, fence);
+    ft_set(4);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     if (recorded) ts_end(s->cb, fence);
     else ts_drop();
@@ -404,8 +480,11 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
     perf_replay(t0);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
+    ft_set(6);   // uploading
     vk_upload_flush(0);
+    ft_set(7);   // prologue
     VkCommandBuffer pro = prologue(c, fence);
+    ft_set(4);
     s = &slots[cur_slot];
     VkCommandBufferSubmitInfo cbi[2] = {{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = pro},
                                         {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->cb}};
@@ -432,9 +511,11 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
         e->fence = fence;
         ReleaseSRWLockExclusive(&pend_lock);
     } else {
+        ft_set(8);   // vkQueueSubmit2
         vk_queue_lock();
         VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
         vk_queue_unlock();
+        ft_set(4);
         if (r != VK_SUCCESS) {
             vk_device_fault_report(r);
             rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
@@ -448,6 +529,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     ReleaseSRWLockExclusive(&st_lock);
     static unsigned subs;
     if (++subs % 4096 == 0) rec_stats_log();
+    ft_set(0);
     ReleaseSRWLockExclusive(&sub_lock);
     return fence;
 }
@@ -491,6 +573,11 @@ static int fence_wait_impl(uint64_t value, uint64_t timeout_ns) {
         ok = 0;   // never submitted nor queued: never reached (as in the null back end)
     } else {
         uint64_t t0 = kern_now_ns();
+        if (ftrace > 0 && value > done) {
+            InterlockedIncrement64(&ft_waits);
+            rt_log("fence: wait %llu issued=%llu done=%llu", (unsigned long long)value,
+                   (unsigned long long)issued, (unsigned long long)done);
+        }
         while (done < value) {
             DWORD ms = INFINITE;
             if (timeout_ns < (1ull << 62)) {
