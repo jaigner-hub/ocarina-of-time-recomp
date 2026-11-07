@@ -6,20 +6,25 @@
 Each runtime/shaders/<name>.comp becomes runtime/<name>_spv.h, which declares `static const uint32_t <name>_spv[]`
 and records the SHA-256 of the source it came from. The headers are committed, so building oot.exe needs no shader
 compiler; tools/build_game.py refuses to build when a header no longer matches its source. Run this after editing a
-shader. Needs glslc and spirv-val from MSYS2 UCRT64 (package mingw-w64-ucrt-x86_64-shaderc, spirv-tools).
+shader. Needs glslc and spirv-val from MSYS2 UCRT64 (package mingw-w64-ucrt-x86_64-shaderc, spirv-tools), or from PATH on Linux.
 
     python tools/build_shaders.py [--check]
 """
 
 import argparse
 import hashlib
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = Path(r'C:\msys64\ucrt64\bin')
+if sys.platform == 'win32':
+    GLSLC, SPIRV_VAL = Path(r'C:\msys64\ucrt64\bin\glslc.exe'), Path(r'C:\msys64\ucrt64\bin\spirv-val.exe')
+else:   # Linux: the tools from PATH (Fedora: glslc from shaderc, spirv-val from spirv-tools)
+    GLSLC = Path(shutil.which('glslc') or 'glslc')
+    SPIRV_VAL = Path(shutil.which('spirv-val') or 'spirv-val')
 TARGET = 'vulkan1.1'
 
 
@@ -57,9 +62,9 @@ def stale(runtime):
 def compile_one(src):
     with tempfile.TemporaryDirectory() as tmp:
         spv = Path(tmp) / 'out.spv'
-        subprocess.run([str(BIN / 'glslc.exe'), '-O', f'--target-env={TARGET}', '-fshader-stage=compute',
+        subprocess.run([str(GLSLC), '-O', f'--target-env={TARGET}', '-fshader-stage=compute',
                         '-o', str(spv), str(src)], check=True)
-        subprocess.run([str(BIN / 'spirv-val.exe'), f'--target-env', TARGET, str(spv)], check=True)
+        subprocess.run([str(SPIRV_VAL), '--target-env', TARGET, str(spv)], check=True)
         data = spv.read_bytes()
     words = [int.from_bytes(data[i:i + 4], 'little') for i in range(0, len(data), 4)]
     header_path(src).write_text(header_of(src, words), encoding='utf-8', newline='\n')

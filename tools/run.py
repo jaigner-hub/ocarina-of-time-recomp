@@ -26,6 +26,7 @@ movie pacing, tensor cores, crashes) and exits non-zero when the run failed or a
 """
 import argparse
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -34,21 +35,30 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EXE = ROOT / "build" / "v131072" / "oot.exe"
+# Windows: oot.exe, also when this script runs in WSL, where it starts the program through interop (WSLENV carries the
+# OOT_* variables). Native Linux: the Linux binary.
+IS_WSL = "microsoft" in platform.uname().release.lower()
+WIN = sys.platform == "win32" or IS_WSL
+EXE = ROOT / "build" / "v131072" / ("oot.exe" if WIN else "oot")
 LOGS = ROOT / "build" / "logs"
 PATH_VARS = {"OOT_SHADER_CACHE", "OOT_INPUT_SCRIPT", "OOT_INPUT_RECORD", "OOT_DUMP_DIR", "OOT_XLATE", "OOT_PROFILE_DIR", "OOT_SHOTS_DIR",
              "OOT_FLIGHT_DIR", "OOT_RDOC_DIR"}
-PROCS = ("oot.exe", "oot_xlate.exe")
+PROCS = ("oot.exe", "oot_xlate.exe") if WIN else ("oot", "oot_xlate")
 
 
 def running() -> list[str]:
+    if not WIN:
+        return [p for p in PROCS if subprocess.run(["pgrep", "-x", p], capture_output=True).returncode == 0]
     out = subprocess.run(["tasklist.exe"], capture_output=True, text=True).stdout.lower()
     return [p for p in PROCS if p in out]
 
 
 def kill_all() -> None:
     for p in PROCS:
-        subprocess.run(["taskkill.exe", "/F", "/IM", p, "/T"], capture_output=True)
+        if WIN:
+            subprocess.run(["taskkill.exe", "/F", "/IM", p, "/T"], capture_output=True)
+        else:
+            subprocess.run(["pkill", "-KILL", "-x", p], capture_output=True)
     for _ in range(20):
         if not running():
             return
@@ -129,7 +139,8 @@ def run_game(seconds: int = 60, shot: str | None = None, env: dict | None = None
         if dump is not None:
             child["OOT_DUMP"] = str(dump)
             child["OOT_DUMP_DIR"] = f"build/logs/dump-{n}"
-        child["WSLENV"] = wslenv(child)
+        if WIN:
+            child["WSLENV"] = wslenv(child)
         shot_path = None
         if shot:
             shot_path = Path(shot) if Path(shot).is_absolute() else ROOT / shot

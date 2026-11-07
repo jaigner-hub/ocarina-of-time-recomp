@@ -32,6 +32,11 @@ MNG_VENDOR = ROOT / "refs" / "MacNativeGames" / "vendor" / "ryujinx"
 XLATE = ROOT / "tools" / "xlate"
 BUILD = ROOT / "build" / "xlate"
 VSWHERE_DIR = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer"
+# NativeAOT target and the file name of the exe; Linux needs clang and zlib headers from the system (no MSVC, no vswhere).
+if sys.platform == "win32":
+    RID, EXE_NAME = "win-x64", "oot_xlate.exe"
+else:
+    RID, EXE_NAME = "linux-x64", "oot_xlate"
 
 
 def tree_hashes(base: Path) -> dict[str, str]:
@@ -143,16 +148,19 @@ def main() -> None:
         global BUILD
         BUILD = a.out.resolve()
     if a.id_only:
-        write_identity(BUILD / "oot_xlate.exe")
+        write_identity(BUILD / EXE_NAME)
         return
     started = time.time()
     dotnet = shutil.which("dotnet")
     if not dotnet:
         sys.exit("missing: dotnet (.NET 10 SDK)")
-    if not (VSWHERE_DIR / "vswhere.exe").is_file() and not shutil.which("vswhere"):
-        sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
     env = dict(os.environ)
-    env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
+    if sys.platform == "win32":
+        if not (VSWHERE_DIR / "vswhere.exe").is_file() and not shutil.which("vswhere"):
+            sys.exit(f"missing: vswhere.exe (expected in {VSWHERE_DIR}); NativeAOT cannot link without it")
+        env["PATH"] = str(VSWHERE_DIR) + os.pathsep + env["PATH"]
+    elif not shutil.which("clang"):
+        sys.exit("missing: clang (NativeAOT links with it on Linux; install clang and zlib-devel)")
 
     verify_vendor()
     src = prepare_sources()
@@ -164,13 +172,13 @@ def main() -> None:
     out = BUILD / "publish"
     shutil.rmtree(out, ignore_errors=True)
     cmd = [
-        dotnet, "publish", str(work / "oot_xlate.csproj"), "-c", "Release", "-r", "win-x64",
+        dotnet, "publish", str(work / "oot_xlate.csproj"), "-c", "Release", "-r", RID,
         "-p:PublishAot=true", "-p:InvariantGlobalization=true", f"-p:RyuSrc={src}", "-o", str(out),
     ]
     if subprocess.run(cmd, env=env).returncode != 0:
         sys.exit("dotnet publish failed")
-    exe = BUILD / "oot_xlate.exe"
-    shutil.copy2(out / "oot_xlate.exe", exe)
+    exe = BUILD / EXE_NAME
+    shutil.copy2(out / EXE_NAME, exe)
     write_identity(exe)
     print(f"built {exe} ({exe.stat().st_size / 1e6:.1f} MB) in {time.time() - started:.0f} s")
 

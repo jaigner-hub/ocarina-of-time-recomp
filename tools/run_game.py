@@ -36,10 +36,14 @@ SAVES = ROOT / 'build' / 'save-backup'
 SLOTS = ROOT / 'build' / 'run-slots'
 GPU_LOCK = ROOT / 'build' / '.gpu-run.lock'
 LOCK_OFFSET = 1 << 16   # Windows byte-range lock sits past the holder text, so other processes can still read it
+EXE_NAME = 'oot.exe' if os.name == 'nt' else 'oot'
 MAX_RUNS = int(os.environ.get('OOT_MAX_RUNS', '3'))   # more parallel runs exhaust device memory (16 GB RX 9070)
 
 
 def count(image):
+    if os.name != 'nt':
+        out = subprocess.run(['pgrep', '-x', '-c', image.removesuffix('.exe')], capture_output=True, text=True).stdout
+        return int(out.strip() or 0)   # pgrep prints 0 and exits 1 when nothing matches
     out = subprocess.run(['tasklist', '/FI', f'IMAGENAME eq {image}', '/NH'], capture_output=True, text=True).stdout
     return sum(line.lower().startswith(image) for line in out.splitlines())
 
@@ -51,6 +55,8 @@ def busy():
 def keep_in_background(proc):
     """Push the game window behind the user's windows as soon as it appears, for builds older than
     OOT_BACKGROUND_WINDOW."""
+    if os.name != 'nt':
+        return   # window stacking is the compositor's business on Linux
     user32 = ctypes.windll.user32
     user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
     user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -80,7 +86,10 @@ def take_slot():
         for i in range(MAX_RUNS):
             f = open(SLOTS / f'slot{i}.lock', 'a+b')
             try:
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                if os.name == 'nt':
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return f
             except OSError:
                 f.close()
@@ -186,7 +195,7 @@ def main():
         for kv in a.env:
             k, _, v = kv.partition('=')
             env[k] = v
-        args = [str(exe_dir / 'oot.exe'), '--profile', str(prof), '--seconds', str(a.seconds)]
+        args = [str(exe_dir / EXE_NAME), '--profile', str(prof), '--seconds', str(a.seconds)]
         if a.shot:
             args += ['--shot', str(a.shot.resolve())]
         try:

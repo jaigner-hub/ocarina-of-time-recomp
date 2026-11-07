@@ -54,7 +54,6 @@ Standard library only.
 """
 import argparse
 import ctypes
-import ctypes.wintypes as wt
 import hashlib
 import json
 import os
@@ -64,6 +63,9 @@ import sys
 import time
 from pathlib import Path
 
+if sys.platform == 'win32':
+    import ctypes.wintypes as wt
+
 import romfs_index
 from build_shaders import stale as stale_shaders
 from check_content import GENERATED_MARKER
@@ -72,33 +74,55 @@ ROOT = Path(__file__).resolve().parent.parent
 # In a git worktree (tools/worktree.py) build/ and generated/ are junctions into the main checkout, and resolve() follows
 # them. MAIN_ROOT is where they land, so resolved paths still print and compare relative to a root.
 MAIN_ROOT = (ROOT / 'build').resolve().parent
-UCRT = Path(r'C:\msys64\ucrt64\bin')
-CLANG = UCRT / 'clang.exe'
-NINJA = UCRT / 'ninja.exe'
-SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll',
-             UCRT / 'libopenh264-8.dll']   # OOT: the movies' H.264 decoder for a development build; an install gets
-                                           # Cisco's DLL from the installer instead (runtime/ov_movie.c h264_lib)
+def find_tool(name):
+    """The executable called name on PATH, else name itself as a path that does not exist, so main() says which tool
+    is missing."""
+    return Path(shutil.which(name) or name)
+
 
 # Flags for generated code as LAS Recomp builds it (Makefile GENFLAGS, Windows), plus -march for the FP/SIMD lowering.
 GEN_FLAGS = ['-O1', '-fno-strict-aliasing', '-Wno-return-type', '-Wno-unused-label', '-fvisibility=hidden',
              '-march=x86-64-v3']
-# _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain) to
-# Windows 7, which hides the per-monitor DPI functions gfx_window.c and dpi_probe.c call.
-RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3', '-D_WIN32_WINNT=0x0A00']
-# -Xlinker passes the map path as one argument; -Wl, would split it at any comma in the build dir path
-LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Xlinker', '"--Map=$builddir/oot.map"']   # the map feeds tools/prof_report.py
-LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libdav1d.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx and dav1d static (movies)
-VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
-# --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
-LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lvulkan-1', '-lSDL3', '-lopus',
-                  '-l:libvpx.a', '-l:libdav1d.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
 DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 # Runtime sources compiled per install, not in the library: romfs.c includes romfs_config.h, patches.c the patches.h
 # of the player's game version (its patch page is the page after that version's main).
 INSTALL_SIDE = {'romfs.c', 'patches.c'}
 LIB_NAME = 'libootrt.a'
-AR = UCRT / 'llvm-ar.exe' if (UCRT / 'llvm-ar.exe').is_file() else UCRT / 'ar.exe'   # MSYS2 without the llvm package has binutils' ar
-WINDRES = UCRT / 'windres.exe'   # runtime/oot.rc: the manifest of oot.exe
+# --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
+if sys.platform == 'win32':
+    UCRT = Path(r'C:\msys64\ucrt64\bin')
+    CLANG = UCRT / 'clang.exe'
+    NINJA = UCRT / 'ninja.exe'
+    SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll',
+                 UCRT / 'libopenh264-8.dll']   # OOT: the movies' H.264 decoder for a development build; an install gets
+                                               # Cisco's DLL from the installer instead (runtime/ov_movie.c h264_lib)
+    # _WIN32_WINNT: Windows 10, the port's minimum. MSYS2's headers default to it, llvm-mingw's (the release toolchain)
+    # to Windows 7, which hides the per-monitor DPI functions gfx_window.c and dpi_probe.c call.
+    RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3', '-D_WIN32_WINNT=0x0A00']
+    # -Xlinker passes the map path as one argument; -Wl, would split it at any comma in the build dir path
+    LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216', '-Xlinker', '"--Map=$builddir/oot.map"']   # the map feeds tools/prof_report.py
+    LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libdav1d.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx and dav1d static (movies)
+    VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
+    LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-lwinmm', '-lvulkan-1', '-lSDL3', '-lopus',
+                      '-l:libvpx.a', '-l:libdav1d.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
+    AR = UCRT / 'llvm-ar.exe' if (UCRT / 'llvm-ar.exe').is_file() else UCRT / 'ar.exe'   # MSYS2 without the llvm package has binutils' ar
+    WINDRES = UCRT / 'windres.exe'   # runtime/oot.rc: the manifest of oot.exe
+    EXE_NAME = 'oot.exe'
+else:
+    # Linux: clang, ninja and binutils from PATH (Fedora: clang, ninja-build, binutils). No DLLs are copied beside the
+    # program. The link libraries are a first guess until runtime/platform/linux.c exists (the runtime is not ported).
+    UCRT = None
+    CLANG = find_tool('clang')
+    NINJA = find_tool('ninja')
+    SDL3_DLLS = []
+    RT_FLAGS = ['-O2', '-g', '-Wall', '-fno-strict-aliasing', '-march=x86-64-v3']
+    LINK_FLAGS = ['-Xlinker', '"--Map=$builddir/oot.map"']
+    LINK_LIBS = ['-lvulkan', '-lSDL3', '-lopus', '-lm', '-lpthread', '-ldl']
+    VMA_INCLUDE = Path('/usr/include')   # vk_mem_alloc.h from the VulkanMemoryAllocator-devel package
+    LLVM_LINK_LIBS = LINK_LIBS
+    AR = find_tool('llvm-ar') if shutil.which('llvm-ar') else find_tool('ar')
+    WINDRES = Path('windres')   # unused: runtime_sources() leaves out runtime/*.rc on Linux
+    EXE_NAME = 'oot'
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # Display version of each build version name (the update's version number, as extract_exefs.py names the folder).
@@ -189,7 +213,8 @@ def runtime_sources(skip=()):
     so a task adds a file without editing this script."""
     pats = ('*.c', '*.cpp', 'platform/*.c', '*.rc', 'ui/*.cpp', 'third_party/imgui/*.cpp',
             'third_party/imgui/backends/*.cpp')
-    return sorted(p for pat in pats for p in RUNTIME.glob(pat) if p.name not in skip)
+    return sorted(p for pat in pats for p in RUNTIME.glob(pat)
+                  if p.name not in skip and (sys.platform == 'win32' or p.suffix != '.rc'))
 
 
 def runtime_object(out, src):
@@ -311,7 +336,7 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
         rt.append(o)
     objs['runtime'] = rt
     every = [o for v in objs.values() for o in v]
-    exe = out / 'oot.exe'
+    exe = out / EXE_NAME
     if make_lib:
         exe = out / LIB_NAME
         lines += ['', 'rule ar', f'  command = {cmd_arg(AR.as_posix())} rcs $out $in', '  description = AR $out', '', f'build {ninja_path(exe)}: ar ' + ' '.join(ninja_path(o) for o in every),
@@ -502,64 +527,84 @@ def verify_objects(out, objs, borrowed, main_out, pairs, base, env):
     print(f'objects verified: {verified}, recompiled after a hash mismatch: {recompiled} ({time.monotonic() - t0:.1f} s)')
 
 
-# ---- Windows job object: peak memory of a process tree
-class IoCounters(ctypes.Structure):
-    _fields_ = [(n, ctypes.c_ulonglong) for n in ('r_ops', 'w_ops', 'o_ops', 'r_bytes', 'w_bytes', 'o_bytes')]
+if sys.platform == 'win32':
+    # ---- Windows job object: peak memory of a process tree
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ('r_ops', 'w_ops', 'o_ops', 'r_bytes', 'w_bytes', 'o_bytes')]
 
 
-class BasicLimits(ctypes.Structure):
-    _fields_ = [('PerProcessUserTimeLimit', ctypes.c_longlong), ('PerJobUserTimeLimit', ctypes.c_longlong),
-                ('LimitFlags', wt.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t),
-                ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wt.DWORD),
-                ('Affinity', ctypes.c_size_t), ('PriorityClass', wt.DWORD), ('SchedulingClass', wt.DWORD)]
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [('PerProcessUserTimeLimit', ctypes.c_longlong), ('PerJobUserTimeLimit', ctypes.c_longlong),
+                    ('LimitFlags', wt.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t),
+                    ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wt.DWORD),
+                    ('Affinity', ctypes.c_size_t), ('PriorityClass', wt.DWORD), ('SchedulingClass', wt.DWORD)]
 
 
-class ExtendedLimits(ctypes.Structure):
-    _fields_ = [('BasicLimitInformation', BasicLimits), ('IoInfo', IoCounters),
-                ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t),
-                ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [('BasicLimitInformation', BasicLimits), ('IoInfo', IoCounters),
+                    ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t),
+                    ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
 
 
-JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-CREATE_SUSPENDED = 0x4
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    CREATE_SUSPENDED = 0x4
+
+
+    def run_measured_win(cmd, env):
+        """Run cmd in its own job object. Returns (exit code, seconds, peak bytes of one process, peak bytes of all)."""
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.CreateJobObjectW.restype = wt.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+        k32.QueryInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD, ctypes.c_void_p]
+        k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+        ntdll = ctypes.WinDLL('ntdll')
+        ntdll.NtResumeProcess.argtypes = [wt.HANDLE]
+
+        job = k32.CreateJobObjectW(None, None)
+        info = ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE   # Ctrl+C stops every compile
+        k32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info))
+        t0 = time.monotonic()
+        # Suspended until it is in the job, so the compilers it starts are counted from the first one.
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, creationflags=CREATE_SUSPENDED)
+        if not k32.AssignProcessToJobObject(job, int(proc._handle)):
+            print(f'build_game: cannot track memory (error {ctypes.get_last_error()})', file=sys.stderr)
+        ntdll.NtResumeProcess(int(proc._handle))
+        try:
+            code = proc.wait()
+        except KeyboardInterrupt:
+            k32.CloseHandle(job)
+            raise
+        dt = time.monotonic() - t0
+        k32.QueryInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+                                      ctypes.sizeof(info), None)
+        k32.CloseHandle(job)
+        return code, dt, info.PeakProcessMemoryUsed, info.PeakJobMemoryUsed
+
+
+def run_measured_posix(cmd, env):
+    """Linux: no job object, so wait4 gives the peak resident size of the largest process in ninja's tree (ninja and
+    the compilers it waited for). That is one process, not the sum; the sum is not reported here."""
+    t0 = time.monotonic()
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=env)
+    _, status, usage = os.wait4(proc.pid, 0)
+    proc.returncode = os.waitstatus_to_exitcode(status)
+    return proc.returncode, time.monotonic() - t0, usage.ru_maxrss * 1024, None   # ru_maxrss is in KiB on Linux
 
 
 def run_measured(cmd, env):
-    """Run cmd in its own job object. Returns (exit code, seconds, peak bytes of one process, peak bytes of all)."""
-    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
-    k32.CreateJobObjectW.restype = wt.HANDLE
-    k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
-    k32.SetInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
-    k32.QueryInformationJobObject.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD, ctypes.c_void_p]
-    k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
-    k32.CloseHandle.argtypes = [wt.HANDLE]
-    ntdll = ctypes.WinDLL('ntdll')
-    ntdll.NtResumeProcess.argtypes = [wt.HANDLE]
-
-    job = k32.CreateJobObjectW(None, None)
-    info = ExtendedLimits()
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE   # Ctrl+C stops every compile
-    k32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info))
-    t0 = time.monotonic()
-    # Suspended until it is in the job, so the compilers it starts are counted from the first one.
-    proc = subprocess.Popen(cmd, cwd=ROOT, env=env, creationflags=CREATE_SUSPENDED)
-    if not k32.AssignProcessToJobObject(job, int(proc._handle)):
-        print(f'build_game: cannot track memory (error {ctypes.get_last_error()})', file=sys.stderr)
-    ntdll.NtResumeProcess(int(proc._handle))
-    try:
-        code = proc.wait()
-    except KeyboardInterrupt:
-        k32.CloseHandle(job)
-        raise
-    dt = time.monotonic() - t0
-    k32.QueryInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
-                                  ctypes.sizeof(info), None)
-    k32.CloseHandle(job)
-    return code, dt, info.PeakProcessMemoryUsed, info.PeakJobMemoryUsed
+    """Run cmd. Returns (exit code, seconds, peak bytes of one process, peak bytes of all processes or None)."""
+    if sys.platform == 'win32':
+        return run_measured_win(cmd, env)
+    return run_measured_posix(cmd, env)
 
 
 def total_ram():
+    if sys.platform != 'win32':
+        return os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
     class MemStatus(ctypes.Structure):
         _fields_ = [('dwLength', wt.DWORD), ('dwMemoryLoad', wt.DWORD)] + \
                    [(n, ctypes.c_ulonglong) for n in ('total', 'avail', 'tpf', 'apf', 'tv', 'av', 'aev')]
@@ -651,7 +696,7 @@ def main():
         dlls = sorted((DEPS / 'bin').glob('*.dll'))
     for tool in (CLANG, NINJA):
         if not tool.is_file():
-            sys.exit(f'{tool} not found: install MSYS2 UCRT64 clang, lld and ninja (docs/building.md)')
+            sys.exit(f'{tool} not found: install MSYS2 UCRT64 clang, lld and ninja on Windows, or clang and ninja on Linux (docs/building.md)')
     if not (gen / 'layout.json').is_file():
         sys.exit(f'{gen / "layout.json"} not found: run the generator first')
 
@@ -710,13 +755,13 @@ def main():
                                  args.make_runtime_lib)
     write_if_changed(out / 'build.ninja', text)
 
-    env = dict(os.environ, PATH=str(TOOLCHAIN_BIN or UCRT) + os.pathsep + os.environ.get('PATH', ''))
+    env = dict(os.environ, PATH=os.pathsep.join([str(d) for d in (TOOLCHAIN_BIN, UCRT) if d] + [os.environ.get('PATH', '')]))
     base = [str(NINJA), '-f', str(out / 'build.ninja'), '-j', str(jobs)]
     nfiles = sum(len(v) for v in mods.values())
     print(f'build_game: {nfiles} generated files in {len(linked)} modules ({", ".join(linked)}), {jobs} jobs', flush=True)
 
     code, dt, peak_one, peak_all = run_measured(base + ['objects'], env)
-    print(f'compile: {dt:.1f} s, peak {mib(peak_one)} per process, {mib(peak_all)} all processes')
+    print(f'compile: {dt:.1f} s, peak {mib(peak_one)} per process' + (f', {mib(peak_all)} all processes' if peak_all else ''))
     if code:
         sys.exit(code)
     for mod, files in objs.items():
@@ -738,6 +783,9 @@ def main():
         return
     for dll in dlls:   # dynamic SDL3 (zlib) and its libiconv (LGPL, unmodified DLL), found next to oot.exe
         shutil.copy2(dll, exe.parent / dll.name)
+    if sys.platform != 'win32':
+        print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}')
+        return
     sections, image = pe_sections(exe)
     print(f'{below_root(exe)}: file {mib(exe.stat().st_size)}, '
           f'image {mib(image)}; ' + ', '.join(f'{k} {mib(v)}' for k, v in sections.items() if k.startswith('.') and v))
