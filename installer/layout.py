@@ -32,8 +32,13 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 EXE = '.exe' if os.name == 'nt' else ''
-UCRT = Path(r'C:\msys64\ucrt64\bin')
+UCRT = (MSYS2_ROOT / r'ucrt64\bin')
 # Updates the installer builds; the check identifies the player's by hash. OOT: 1.1.0, the last Switch 1 update.
 SUPPORTED = ('1.1.0',)
 # OOT names a version by its CNMT number (tools/extract_exefs.py): the folder of build_game.py and the patch table.

@@ -43,7 +43,9 @@ PROCS = ("oot.exe", "oot_xlate.exe")
 
 def running() -> list[str]:
     out = subprocess.run(["tasklist.exe"], capture_output=True, text=True).stdout.lower()
-    return [p for p in PROCS if p in out]
+    # Whole image names: a substring test takes WhatsApp.Root.exe for oot.exe.
+    names = {line.split()[0] for line in out.splitlines() if line.strip()}
+    return [p for p in PROCS if p.lower() in names]
 
 
 def kill_all() -> None:

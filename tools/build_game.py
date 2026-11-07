@@ -68,11 +68,16 @@ import romfs_index
 from build_shaders import stale as stale_shaders
 from check_content import GENERATED_MARKER
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parent.parent
 # In a git worktree (tools/worktree.py) build/ and generated/ are junctions into the main checkout, and resolve() follows
 # them. MAIN_ROOT is where they land, so resolved paths still print and compare relative to a root.
 MAIN_ROOT = (ROOT / 'build').resolve().parent
-UCRT = Path(r'C:\msys64\ucrt64\bin')
+UCRT = (MSYS2_ROOT / r'ucrt64\bin')
 CLANG = UCRT / 'clang.exe'
 NINJA = UCRT / 'ninja.exe'
 SDL3_DLLS = [UCRT / 'SDL3.dll', UCRT / 'libiconv-2.dll', UCRT / 'libopus-0.dll',

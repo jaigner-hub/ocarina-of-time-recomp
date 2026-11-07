@@ -21,12 +21,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parent.parent
 URL = 'https://github.com/SciresM/hactool.git'
 COMMIT = '1d64a83450e025622f3468c28fc4164dad2c5ef6'
 PATCHES = [ROOT / 'tools' / 'hactool' / n for n in ('portable.patch', 'unicode.patch')]
 WINDOWS = os.name == 'nt'
-MSYS_BASH = Path(r'C:\msys64\usr\bin\bash.exe')
+MSYS_BASH = (MSYS2_ROOT / r'usr\bin\bash.exe')
 EXE = 'hactool.exe' if WINDOWS else 'hactool'
 # Windows links statically so the exe needs only KERNEL32 and the UCRT. On Linux the mbedtls archives are linked in
 # anyway and glibc stays dynamic.

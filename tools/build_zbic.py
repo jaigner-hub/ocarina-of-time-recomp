@@ -18,13 +18,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[1] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parent.parent
 URL = 'https://github.com/facebook/zstd.git'
 COMMIT = 'f8745da6ff1ad1e7bab384bd1f9d742439278e99'   # v1.5.7
 OURS = ROOT / 'tools' / 'zbic'
 PATCH = OURS / 'zbic.patch'
 WINDOWS = os.name == 'nt'
-MSYS_GCC = Path(r'C:\msys64\ucrt64\bin\gcc.exe')
+MSYS_GCC = (MSYS2_ROOT / r'ucrt64\bin\gcc.exe')
 EXE = 'nso_unzbic.exe' if WINDOWS else 'nso_unzbic'
 ZSTD_SOURCES = ['common/entropy_common.c', 'common/error_private.c', 'common/fse_decompress.c', 'common/zstd_common.c',
                 'common/xxhash.c', 'common/debug.c', 'decompress/huf_decompress.c', 'decompress/zstd_ddict.c',

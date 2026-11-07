@@ -16,6 +16,11 @@ import capstone
 import unicorn as uc
 from unicorn import arm64_const as A
 
+# MSYS2: OOT_MSYS2 if set, else a copy inside the repository (toolchain/msys64, ignored), else C:\msys64.
+MSYS2_ROOT = Path(os.environ.get('OOT_MSYS2') or next(
+    (d for d in [Path(__file__).resolve().parents[2] / 'toolchain' / 'msys64'] if d.is_dir()),
+    Path(r'C:\msys64')))
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'recomp'))
 
@@ -27,7 +32,7 @@ IN_FMT = '<QQ32QQQ'
 IN_TAIL = '<QQ'
 OUT_SIZE = 32 * 8 + 4 * 8 + 32 * 16
 
-MSYS_BIN = Path(r'C:\msys64\ucrt64\bin')
+MSYS_BIN = (MSYS2_ROOT / r'ucrt64\bin')
 
 F32 = [0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00000, 0xffc00000, 0x7fa00001, 0xff812345, 0x7fd00abc,
        0x00000001, 0x80000001, 0x007fffff, 0x807fffff, 0x00400000, 0x00800000, 0x80800000, 0x00800001, 0x7f7fffff,
